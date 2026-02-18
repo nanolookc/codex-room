@@ -1,0 +1,9 @@
+{
+  "name": "nlk-agents-cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "nlk-agents": "./src/index.ts"
+  }
+}

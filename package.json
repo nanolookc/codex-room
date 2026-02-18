@@ -1,0 +1,21 @@
+{
+  "name": "nlk-agents",
+  "private": true,
+  "packageManager": "bun@1.2.22",
+  "bin": {
+    "nlk-agents": "./cli/src/index.ts"
+  },
+  "workspaces": [
+    "backend",
+    "cli",
+    "frontend",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd backend dev & bun run --cwd frontend dev",
+    "dev:backend": "bun run --cwd backend dev",
+    "dev:frontend": "bun run --cwd frontend dev",
+    "start:anywhere": "bun run ./cli/src/index.ts start",
+    "build": "bun run --cwd shared build && bun run --cwd backend build && bun run --cwd frontend build"
+  }
+}

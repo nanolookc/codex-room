@@ -1,0 +1,86 @@
+export type Role = 'owner' | 'editor' | 'viewer';
+
+export interface ChatMessage {
+  id: string;
+  roomId: string;
+  userId: string;
+  userName: string;
+  text: string;
+  createdAt: string;
+}
+
+export interface EditorState {
+  roomId: string;
+  text: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface RoomSummary {
+  roomId: string;
+  updatedAt: string;
+  messageCount: number;
+  timelineCount: number;
+  hasThreadId: boolean;
+  preview?: string;
+}
+
+export interface TimelineEntry {
+  id: string;
+  roomId: string;
+  side: 'left' | 'right';
+  label: string;
+  text: string;
+  at: string;
+  meta?: {
+    kind:
+      | 'user.message'
+      | 'codex.started'
+      | 'codex.item'
+      | 'codex.completed'
+      | 'codex.failed';
+    itemType?: string;
+    model?: string;
+    reasoningEffort?: string;
+  };
+}
+
+export type CodexItem = {
+  type: string;
+  [key: string]: unknown;
+};
+
+export type RoomEvent =
+  | { type: 'timeline.entry'; entry: TimelineEntry }
+  | { type: 'chat.message'; message: ChatMessage }
+  | { type: 'editor.updated'; editor: EditorState }
+  | { type: 'presence.joined'; userId: string; userName: string; at: string }
+  | { type: 'presence.left'; userId: string; at: string }
+  | {
+      type: 'codex.turn.started';
+      roomId: string;
+      prompt: string;
+      at: string;
+      model?: string;
+      reasoningEffort?: string;
+    }
+  | { type: 'codex.item.completed'; item: CodexItem; at: string }
+  | { type: 'codex.turn.completed'; finalResponse: string; usage?: unknown; at: string }
+  | { type: 'codex.turn.failed'; error: string; at: string };
+
+export interface SendMessageInput {
+  userId: string;
+  userName: string;
+  text: string;
+}
+
+export interface UpdateEditorInput {
+  userId: string;
+  text: string;
+}
+
+export interface RunCodexInput {
+  userId: string;
+  userName: string;
+  prompt?: string;
+}
