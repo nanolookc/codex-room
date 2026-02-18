@@ -29,3 +29,32 @@ Press Ctrl+C to stop.
 ```
 
 For now, you need to create a tunnel manually with tools like ngrok or Cloudflare Tunnel.
+
+## Developer setup
+
+### 1) Install dependencies
+
+```bash
+bun install
+```
+
+### 2) Link the CLI locally
+
+```bash
+bun link
+```
+
+After linking, `codex-room` should be available in your shell, launch it from any folder:
+
+```bash
+codex-room start
+```
+
+### 3) Run in development mode (in folder of codex-room for now)
+
+Run backend + frontend together:
+
+```bash
+bun run dev:backend
+bun run dev:frontend
+```
