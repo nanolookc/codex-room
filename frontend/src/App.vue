@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import type { RoomEvent, TimelineEntry } from '@nlk/shared';
+import type { EditorCursor, RoomEvent, TimelineEntry } from '@codex-room/shared';
 import DiffPatch from './components/DiffPatch.vue';
 
 const query = new URLSearchParams(window.location.search);
@@ -22,6 +22,27 @@ type CodexThreadSummary = {
   cwd?: string;
 };
 const codexThreads = ref<CodexThreadSummary[]>([]);
+const editorEl = ref<HTMLTextAreaElement | null>(null);
+
+const CURSOR_COLORS = [
+  '#ef4444',
+  '#f59e0b',
+  '#10b981',
+  '#06b6d4',
+  '#3b82f6',
+  '#8b5cf6',
+  '#ec4899'
+];
+const REMOTE_CURSOR_MAX_AGE_MS = 20_000;
+
+type CursorOverlay = {
+  userId: string;
+  userName: string;
+  color: string;
+  left: number;
+  top: number;
+  height: number;
+};
 
 type LogEntry = {
   id: string;
@@ -34,6 +55,8 @@ type LogEntry = {
 
 const logEntries = ref<LogEntry[]>([]);
 const editorText = ref('');
+const editorCursors = ref<EditorCursor[]>([]);
+const cursorOverlays = ref<CursorOverlay[]>([]);
 const running = ref(false);
 const timelineEl = ref<HTMLElement | null>(null);
 const activeTaskStartedAt = ref<number | null>(null);
@@ -56,6 +79,97 @@ let eventsConnectionSeq = 0;
 
 const canSend = computed(() => editorText.value.trim().length > 0 && !running.value);
 
+function hashString(value: string): number {
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = (hash << 5) - hash + value.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function colorForUser(user: string): string {
+  return CURSOR_COLORS[hashString(user) % CURSOR_COLORS.length] ?? CURSOR_COLORS[0];
+}
+
+function toMs(value: string): number {
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function clampCursorPosition(position: number, textLength: number): number {
+  return Math.min(textLength, Math.max(0, Math.floor(position)));
+}
+
+function getCaretCoordinates(textarea: HTMLTextAreaElement, position: number) {
+  const doc = textarea.ownerDocument;
+  const mirror = doc.createElement('div');
+  const marker = doc.createElement('span');
+  const style = window.getComputedStyle(textarea);
+
+  const text = textarea.value;
+  const before = text.slice(0, position);
+
+  mirror.style.position = 'absolute';
+  mirror.style.top = '0';
+  mirror.style.left = '-9999px';
+  mirror.style.visibility = 'hidden';
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.wordBreak = 'break-word';
+  mirror.style.overflow = 'hidden';
+  mirror.style.boxSizing = style.boxSizing;
+  mirror.style.width = `${textarea.clientWidth}px`;
+  mirror.style.height = `${textarea.clientHeight}px`;
+  mirror.style.padding = style.padding;
+  mirror.style.border = style.border;
+  mirror.style.font = style.font;
+  mirror.style.letterSpacing = style.letterSpacing;
+  mirror.style.lineHeight = style.lineHeight;
+  mirror.style.textTransform = style.textTransform;
+  mirror.style.textIndent = style.textIndent;
+  mirror.style.tabSize = style.tabSize;
+
+  mirror.textContent = before;
+  marker.textContent = '\u200b';
+  mirror.appendChild(marker);
+  doc.body.appendChild(mirror);
+
+  const left = marker.offsetLeft - textarea.scrollLeft;
+  const top = marker.offsetTop - textarea.scrollTop;
+  const lineHeight = Number.parseFloat(style.lineHeight) || Math.ceil(Number.parseFloat(style.fontSize) * 1.3);
+
+  doc.body.removeChild(mirror);
+  return { left, top, height: lineHeight };
+}
+
+function refreshCursorOverlays() {
+  const el = editorEl.value;
+  if (!el) {
+    cursorOverlays.value = [];
+    return;
+  }
+  const now = Date.now();
+  const next: CursorOverlay[] = [];
+
+  for (const cursor of editorCursors.value) {
+    if (!cursor || cursor.userId === userId.value) continue;
+    if (!cursor.updatedAt || now - toMs(cursor.updatedAt) > REMOTE_CURSOR_MAX_AGE_MS) continue;
+    const index = clampCursorPosition(cursor.selectionEnd ?? cursor.selectionStart ?? 0, editorText.value.length);
+    const coords = getCaretCoordinates(el, index);
+    if (coords.top + coords.height < 0 || coords.top > el.clientHeight) continue;
+    next.push({
+      userId: cursor.userId,
+      userName: cursor.userName || cursor.userId,
+      color: colorForUser(cursor.userId),
+      left: Math.max(0, coords.left),
+      top: Math.max(0, coords.top),
+      height: coords.height
+    });
+  }
+
+  cursorOverlays.value = next;
+}
+
 function normalizeMeta(entry: Pick<LogEntry, 'meta' | 'text' | 'side'>): NonNullable<LogEntry['meta']> {
   if (entry.meta) return entry.meta;
   if (entry.side === 'left') return { kind: 'user.message' };
@@ -70,11 +184,22 @@ function normalizeMeta(entry: Pick<LogEntry, 'meta' | 'text' | 'side'>): NonNull
   return { kind: 'codex.item', itemType: 'unknown' };
 }
 
+function isEmptyRawReasoning(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized.startsWith('Item: reasoning')) return false;
+  if (!normalized.includes('\nraw:\n')) return false;
+  return (
+    /"summary"\s*:\s*\[\s*\]/.test(normalized) &&
+    /"content"\s*:\s*\[\s*\]/.test(normalized)
+  );
+}
+
 function isHiddenItem(entry: Pick<LogEntry, 'meta' | 'text' | 'side'>): boolean {
   const meta = normalizeMeta(entry);
   if (meta.kind !== 'codex.item') return false;
   const itemType = (meta.itemType ?? '').toLowerCase();
   if (itemType === 'user_message' || itemType === 'usermessage') return true;
+  if (itemType === 'reasoning' && isEmptyRawReasoning(entry.text)) return true;
   const firstLine = entry.text.split('\n')[0]?.trim().toLowerCase() ?? '';
   return firstLine === 'item: user_message' || firstLine === 'item: usermessage';
 }
@@ -269,6 +394,24 @@ function turnUsage(group: TurnGroup): string | null {
   }
   const match = end.text.match(/^Tokens:\s*(.+)$/m);
   return match?.[1]?.trim() ?? null;
+}
+
+function turnContext(group: TurnGroup): string | null {
+  const end = group.endEntry;
+  if (!end || getEntryKind(end) !== 'codex.completed') return null;
+  const fromUsage = usageByTurnAt.value.get(end.at)?.contextAvailablePercent;
+  if (typeof fromUsage === 'number') return `${fromUsage}% available`;
+  const match = end.text.match(/^Context:\s*(.+)$/m);
+  return match?.[1]?.trim() ?? null;
+}
+
+function turnMetaTitle(group: TurnGroup): string {
+  const details: string[] = [turnMeta(group)];
+  const usage = turnUsage(group);
+  if (usage) details.push(`Tokens: ${usage}`);
+  const context = turnContext(group);
+  if (context) details.push(`Context: ${context}`);
+  return details.join('\n');
 }
 
 function parseContextAvailablePercent(text: string): number | null {
@@ -472,7 +615,29 @@ function itemBody(item: LogEntry): string {
     const lines = text.split('\n');
     const cmd = lines.find(l => l.startsWith('command:'))?.replace('command:', '').trim() ?? text;
     const exit = lines.find(l => l.startsWith('exit:'))?.trim() ?? '';
-    return exit ? `${cmd}  [${exit}]` : cmd;
+    const markerSet = new Set(['command:', 'exit:', 'stdout:', 'stderr:', 'output:', 'duration_ms:']);
+    const collectBlock = (marker: string): string => {
+      const start = lines.findIndex((line) => line.startsWith(marker));
+      if (start === -1) return '';
+      const out: string[] = [];
+      for (let i = start + 1; i < lines.length; i++) {
+        const line = lines[i];
+        if ([...markerSet].some((prefix) => line.startsWith(prefix))) break;
+        out.push(line);
+      }
+      return out.join('\n').trim();
+    };
+
+    const output = collectBlock('output:');
+    const stdout = collectBlock('stdout:');
+    const stderr = collectBlock('stderr:');
+    const sections: string[] = [];
+    if (output) sections.push(`output:\n${output}`);
+    if (stdout) sections.push(`stdout:\n${stdout}`);
+    if (stderr) sections.push(`stderr:\n${stderr}`);
+
+    const header = exit ? `${cmd}  [${exit}]` : cmd;
+    return sections.length > 0 ? `${header}\n${sections.join('\n\n')}` : header;
   }
   if (meta.itemType === 'reasoning') return text.replace(/\*\*/g, '');
   return text;
@@ -493,6 +658,12 @@ function itemRowAlignClass(item: LogEntry): string {
 
 function itemPatch(item: LogEntry): string | null {
   const text = bodyText(item);
+  const diffMarker = '\ndiff:\n';
+  const diffMarkerIndex = text.indexOf(diffMarker);
+  if (diffMarkerIndex >= 0) {
+    const candidate = text.slice(diffMarkerIndex + diffMarker.length).trim();
+    if (candidate) return candidate;
+  }
   const diffHeaderIndex = text.indexOf('diff --git');
   if (diffHeaderIndex >= 0) return text.slice(diffHeaderIndex).trim();
   const hunkIndex = text.indexOf('@@ ');
@@ -570,6 +741,9 @@ async function loadState() {
 
   logEntries.value = history;
   editorText.value = data.editor.text;
+  editorCursors.value = Array.isArray(data.editor?.cursors) ? data.editor.cursors : [];
+  await nextTick();
+  refreshCursorOverlays();
 
   let lastStarted: LogEntry | null = null;
   let hasTerminalAfterLastStart = false;
@@ -645,6 +819,9 @@ async function switchRoom(nextRoomId: string) {
 
 function goHome() {
   eventsAbortController?.abort();
+  const url = new URL(window.location.href);
+  url.searchParams.delete('room');
+  window.history.replaceState({}, '', url.toString());
   view.value = 'home';
   void loadCodexThreads();
 }
@@ -735,10 +912,13 @@ function connectEvents() {
                   }
                   break;
                 case 'editor.updated':
+                  editorCursors.value = Array.isArray(event.editor.cursors) ? event.editor.cursors : [];
                   if (event.editor.updatedBy !== userId.value) {
                     applyingRemoteEditorUpdate = true;
                     editorText.value = event.editor.text;
+                    await nextTick();
                   }
+                  refreshCursorOverlays();
                   break;
                 case 'codex.turn.started':
                   running.value = true;
@@ -777,21 +957,47 @@ function connectEvents() {
 }
 
 async function syncEditor() {
+  const el = editorEl.value;
   await fetch(`${API}/api/rooms/${roomId.value}/editor`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userId: userId.value, text: editorText.value })
+    body: JSON.stringify({
+      userId: userId.value,
+      userName: userName.value,
+      text: editorText.value,
+      selectionStart: el?.selectionStart ?? editorText.value.length,
+      selectionEnd: el?.selectionEnd ?? editorText.value.length
+    })
   });
+}
+
+function scheduleEditorSync(delayMs = 120) {
+  if (editorTimer) window.clearTimeout(editorTimer);
+  editorTimer = window.setTimeout(syncEditor, delayMs);
 }
 
 watch(editorText, () => {
   if (applyingRemoteEditorUpdate) {
     applyingRemoteEditorUpdate = false;
+    refreshCursorOverlays();
     return;
   }
-  if (editorTimer) window.clearTimeout(editorTimer);
-  editorTimer = window.setTimeout(syncEditor, 120);
+  refreshCursorOverlays();
+  scheduleEditorSync(120);
 });
+
+watch(editorCursors, () => {
+  refreshCursorOverlays();
+}, { deep: true });
+
+function onEditorSelectionChange() {
+  refreshCursorOverlays();
+  scheduleEditorSync(80);
+}
+
+function onEditorScroll() {
+  refreshCursorOverlays();
+}
 
 async function sendToCodex() {
   if (!canSend.value) return;
@@ -816,6 +1022,7 @@ function onEditorKeydown(event: KeyboardEvent) {
 }
 
 onMounted(async () => {
+  window.addEventListener('resize', refreshCursorOverlays);
   await loadRuntime();
   await loadCodexThreads();
   if (view.value === 'chat') {
@@ -829,11 +1036,14 @@ onMounted(async () => {
     await loadState();
     connectEvents();
     scrollToBottom();
+    await nextTick();
+    refreshCursorOverlays();
   }
 });
 
 onUnmounted(() => {
   eventsAbortController?.abort();
+  window.removeEventListener('resize', refreshCursorOverlays);
   if (workingTimer) {
     window.clearInterval(workingTimer);
     workingTimer = null;
@@ -854,7 +1064,7 @@ onUnmounted(() => {
             class="rounded-md border border-neutral-200 px-2 py-0.5 text-[11px] text-neutral-600 hover:bg-neutral-100"
             @click="goHome"
           >
-            Chats
+            ← Chats
           </button>
           <span
             class="size-[7px] rounded-full transition-colors"
@@ -934,13 +1144,9 @@ onUnmounted(() => {
               <span class="size-[6px] shrink-0 rounded-full" :class="turnStatusClass(group)"></span>
               <span class="flex-1 truncate text-[12.5px] font-medium text-neutral-700">{{ turnPrompt(group) }}</span>
               <span
-                v-if="turnUsage(group)"
-                class="hidden shrink-0 rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 text-[10px] text-neutral-500 sm:inline"
-                :title="turnUsage(group) || ''"
-              >
-                {{ turnUsage(group) }}
-              </span>
-              <span class="shrink-0 text-[11px] text-neutral-500">{{ turnMeta(group) }}</span>
+                class="shrink-0 cursor-help text-[11px] text-neutral-500"
+                :title="turnMetaTitle(group)"
+              >{{ turnMeta(group) }}</span>
             </div>
 
             <!-- Segments: agent messages + collapsible tech groups in order -->
@@ -1003,12 +1209,36 @@ onUnmounted(() => {
       <div class="px-5 py-4">
         <div class="relative">
           <textarea
+            ref="editorEl"
             v-model="editorText"
             rows="5"
             class="w-full resize-none rounded-xl border border-neutral-200 bg-neutral-50 px-4 pb-11 pr-28 pt-3 font-sans text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-300 focus:border-neutral-400 focus:bg-white"
             placeholder="Write a prompt..."
             @keydown="onEditorKeydown"
+            @click="onEditorSelectionChange"
+            @keyup="onEditorSelectionChange"
+            @select="onEditorSelectionChange"
+            @scroll="onEditorScroll"
           />
+          <div class="pointer-events-none absolute inset-0 z-10 overflow-visible rounded-xl">
+            <div
+              v-for="cursor in cursorOverlays"
+              :key="cursor.userId"
+              class="absolute"
+              :style="{ left: `${cursor.left}px`, top: `${cursor.top}px` }"
+            >
+              <span
+                class="absolute left-0 top-0 w-0.5 rounded-full"
+                :style="{ height: `${cursor.height}px`, backgroundColor: cursor.color }"
+              ></span>
+              <span
+                class="absolute left-1 top-0 -translate-y-full rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+                :style="{ backgroundColor: cursor.color }"
+              >
+                {{ cursor.userName }}
+              </span>
+            </div>
+          </div>
           <span class="pointer-events-none absolute bottom-3 left-4 text-[11px] text-neutral-400">
             {{ contextAvailabilityText }}
           </span>

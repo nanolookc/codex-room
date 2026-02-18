@@ -4,7 +4,7 @@
     "types": ["bun-types"],
     "baseUrl": ".",
     "paths": {
-      "@nlk/shared": ["../shared/src"]
+      "@codex-room/shared": ["../shared/src"]
     }
   },
   "include": ["src"]

@@ -1,7 +1,8 @@
 import { nanoid } from 'nanoid';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
-import type { ChatMessage, EditorState, RoomEvent, RoomSummary, TimelineEntry } from '@nlk/shared';
+import type { ChatMessage, EditorCursor, EditorState, RoomEvent, RoomSummary, TimelineEntry } from '@codex-room/shared';
 import { AppLogger } from './logger';
 
 type Subscriber = (event: RoomEvent) => void;
@@ -25,6 +26,65 @@ interface PersistedRoomState {
   editor: EditorState;
   threadId?: string;
   updatedAt: string;
+}
+
+const EDITOR_CURSOR_TTL_MS = 60_000;
+
+function toFiniteNonNegativeInteger(value: unknown): number | null {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.floor(n));
+}
+
+function normalizeSelection(
+  selectionStart: unknown,
+  selectionEnd: unknown,
+  textLength: number
+): { start: number; end: number } {
+  const startRaw = toFiniteNonNegativeInteger(selectionStart);
+  const endRaw = toFiniteNonNegativeInteger(selectionEnd);
+  const start = Math.min(textLength, startRaw ?? endRaw ?? textLength);
+  const end = Math.min(textLength, endRaw ?? startRaw ?? textLength);
+  return start <= end ? { start, end } : { start: end, end: start };
+}
+
+function normalizeCursorEntry(
+  cursor: unknown,
+  textLength: number
+): EditorCursor | null {
+  if (!cursor || typeof cursor !== 'object') return null;
+  const obj = cursor as Record<string, unknown>;
+  const userId = typeof obj.userId === 'string' ? obj.userId.trim() : '';
+  if (!userId) return null;
+  const userName = typeof obj.userName === 'string' && obj.userName.trim() ? obj.userName.trim() : userId;
+  const updatedAt = typeof obj.updatedAt === 'string' && obj.updatedAt ? obj.updatedAt : new Date().toISOString();
+  const selection = normalizeSelection(obj.selectionStart, obj.selectionEnd, textLength);
+  return {
+    userId,
+    userName,
+    selectionStart: selection.start,
+    selectionEnd: selection.end,
+    updatedAt
+  };
+}
+
+function normalizeEditor(editor: EditorState | null | undefined, roomId: string): EditorState {
+  const text = typeof editor?.text === 'string' ? editor.text : '';
+  const updatedAt =
+    typeof editor?.updatedAt === 'string' && editor.updatedAt
+      ? editor.updatedAt
+      : new Date().toISOString();
+  const updatedBy =
+    typeof editor?.updatedBy === 'string' && editor.updatedBy
+      ? editor.updatedBy
+      : 'system';
+  const cursors = Array.isArray(editor?.cursors)
+    ? editor.cursors
+        .map((cursor) => normalizeCursorEntry(cursor, text.length))
+        .filter((cursor): cursor is EditorCursor => Boolean(cursor))
+    : [];
+
+  return { roomId, text, updatedAt, updatedBy, ...(cursors.length ? { cursors } : {}) };
 }
 
 export interface RoomThreadSummary {
@@ -533,13 +593,21 @@ export class RoomStore {
   private rooms = new Map<string, RoomState>();
   private readonly storagePath: string;
   private readonly workspace: string;
+  private readonly legacyStoragePaths: string[];
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly logger: AppLogger, workspace = process.env.NLK_WORKDIR ?? process.cwd()) {
     this.workspace = resolve(workspace);
-    this.storagePath =
-      process.env.NLK_ROOMS_STORAGE_PATH ??
-      resolve(process.cwd(), 'backend/.data/rooms.json');
+    const explicitStoragePath = process.env.NLK_ROOMS_STORAGE_PATH?.trim();
+    this.storagePath = explicitStoragePath || resolve(homedir(), '.codex-room/rooms.json');
+    this.legacyStoragePaths = explicitStoragePath
+      ? []
+      : [...new Set([
+          resolve(this.workspace, 'backend/.data/rooms.json'),
+          resolve(this.workspace, '.data/rooms.json'),
+          resolve(process.cwd(), 'backend/.data/rooms.json'),
+          resolve(process.cwd(), '.data/rooms.json')
+        ])].filter((candidate) => candidate !== this.storagePath);
     this.loadFromDisk();
   }
 
@@ -556,7 +624,8 @@ export class RoomStore {
         roomId,
         text: '',
         updatedAt: new Date().toISOString(),
-        updatedBy: 'system'
+        updatedBy: 'system',
+        cursors: []
       },
       subscribers: new Set(),
       updatedAt: new Date().toISOString()
@@ -772,13 +841,35 @@ export class RoomStore {
     return message;
   }
 
-  updateEditor(roomId: string, userId: string, text: string) {
+  updateEditor(
+    roomId: string,
+    userId: string,
+    text: string,
+    options?: { userName?: string; selectionStart?: number; selectionEnd?: number }
+  ) {
     const room = this.getRoom(roomId);
+    const updatedAt = new Date().toISOString();
+    const parsedUpdatedAt = Date.parse(updatedAt);
+    const maxAge = Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt - EDITOR_CURSOR_TTL_MS : Number.NEGATIVE_INFINITY;
+    const currentCursors = Array.isArray(room.editor.cursors) ? room.editor.cursors : [];
+    const nextCursors = currentCursors.filter((cursor) => {
+      const cursorAt = Date.parse(cursor.updatedAt);
+      return Number.isFinite(cursorAt) && cursorAt >= maxAge && cursor.userId !== userId;
+    });
+    const selection = normalizeSelection(options?.selectionStart, options?.selectionEnd, text.length);
+    nextCursors.push({
+      userId,
+      userName: options?.userName?.trim() || userId,
+      selectionStart: selection.start,
+      selectionEnd: selection.end,
+      updatedAt
+    });
     const editor: EditorState = {
       roomId,
       text,
-      updatedAt: new Date().toISOString(),
-      updatedBy: userId
+      updatedAt,
+      updatedBy: userId,
+      cursors: nextCursors
     };
 
     room.editor = editor;
@@ -787,7 +878,8 @@ export class RoomStore {
     this.logger.debug('room.editor.updated', {
       roomId,
       userId,
-      length: text.length
+      length: text.length,
+      cursorCount: nextCursors.length
     });
     this.publish(roomId, { type: 'editor.updated', editor });
     return editor;
@@ -953,8 +1045,11 @@ export class RoomStore {
 
   private loadFromDisk() {
     try {
-      if (!existsSync(this.storagePath)) return;
-      const raw = readFileSync(this.storagePath, 'utf-8');
+      const sourcePath = existsSync(this.storagePath)
+        ? this.storagePath
+        : this.legacyStoragePaths.find((candidate) => existsSync(candidate));
+      if (!sourcePath) return;
+      const raw = readFileSync(sourcePath, 'utf-8');
       const parsed = JSON.parse(raw) as { rooms?: PersistedRoomState[] };
       const rooms = Array.isArray(parsed.rooms) ? parsed.rooms : [];
       for (const room of rooms) {
@@ -963,16 +1058,23 @@ export class RoomStore {
           workspace: typeof room.workspace === 'string' ? room.workspace : '',
           messages: Array.isArray(room.messages) ? room.messages : [],
           timeline: Array.isArray(room.timeline) ? room.timeline : [],
-          editor: room.editor,
+          editor: normalizeEditor(room.editor, room.roomId),
           subscribers: new Set(),
           threadId: room.threadId,
           updatedAt: room.updatedAt ?? new Date().toISOString()
         });
       }
       this.logger.info('room.storage.loaded', {
-        storagePath: this.storagePath,
+        storagePath: sourcePath,
         rooms: rooms.length
       });
+      if (sourcePath !== this.storagePath) {
+        this.logger.info('room.storage.migrating', {
+          from: sourcePath,
+          to: this.storagePath
+        });
+        this.persistToDisk();
+      }
     } catch (error) {
       this.logger.error('room.storage.load_failed', {
         storagePath: this.storagePath,

@@ -1,5 +1,5 @@
 {
-  "name": "@nlk/shared",
+  "name": "@codex-room/shared",
   "version": "0.0.1",
   "type": "module",
   "exports": {

@@ -1,7 +1,7 @@
 import { Elysia, sse } from 'elysia';
 import { cors } from '@elysiajs/cors';
 import { resolve } from 'node:path';
-import type { RunCodexInput, SendMessageInput, UpdateEditorInput } from '@nlk/shared';
+import type { RunCodexInput, SendMessageInput, UpdateEditorInput } from '@codex-room/shared';
 import { RoomStore } from './services/room-store';
 import { CodexRunner } from './services/codex-runner';
 import { AppLogger } from './services/logger';
@@ -140,9 +140,15 @@ const app = new Elysia()
     logger.debug('room.editor.requested', {
       roomId: params.roomId,
       userId: input.userId,
-      length: input.text?.length ?? 0
+      length: input.text?.length ?? 0,
+      selectionStart: input.selectionStart ?? null,
+      selectionEnd: input.selectionEnd ?? null
     });
-    return roomStore.updateEditor(params.roomId, input.userId, input.text);
+    return roomStore.updateEditor(params.roomId, input.userId, input.text, {
+      userName: input.userName,
+      selectionStart: input.selectionStart,
+      selectionEnd: input.selectionEnd
+    });
   })
   .post('/api/rooms/:roomId/codex/run', async ({ params, body, set }) => {
     const input = body as RunCodexInput;

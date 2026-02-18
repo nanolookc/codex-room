@@ -1,9 +1,9 @@
 {
-  "name": "nlk-agents",
+  "name": "codex-room",
   "private": true,
   "packageManager": "bun@1.2.22",
   "bin": {
-    "nlk-agents": "./cli/src/index.ts"
+    "codex-room": "./cli/src/index.ts"
   },
   "workspaces": [
     "backend",

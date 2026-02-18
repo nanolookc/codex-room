@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import type { RoomEvent } from '@nlk/shared';
+import type { RoomEvent } from '@codex-room/shared';
 import { AppLogger } from './logger';
 
 type JsonRpcError = {
@@ -392,8 +392,8 @@ class AppServerSession {
 
     await session.request('initialize', {
       clientInfo: {
-        name: 'nlk_agents',
-        title: 'NLK Agents',
+        name: 'codex_room',
+        title: 'Codex Room',
         version: '0.1.0'
       },
       capabilities: {

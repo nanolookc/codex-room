@@ -14,6 +14,15 @@ export interface EditorState {
   text: string;
   updatedAt: string;
   updatedBy: string;
+  cursors?: EditorCursor[];
+}
+
+export interface EditorCursor {
+  userId: string;
+  userName: string;
+  selectionStart: number;
+  selectionEnd: number;
+  updatedAt: string;
 }
 
 export interface RoomSummary {
@@ -76,7 +85,10 @@ export interface SendMessageInput {
 
 export interface UpdateEditorInput {
   userId: string;
+  userName?: string;
   text: string;
+  selectionStart?: number;
+  selectionEnd?: number;
 }
 
 export interface RunCodexInput {

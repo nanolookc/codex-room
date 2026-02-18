@@ -58,7 +58,7 @@ function getPrimaryIp(): string {
 }
 
 function printUsage() {
-  console.log('Usage: nlk-agents start [--backend-port 3001] [--host 0.0.0.0] [--room <id>]');
+  console.log('Usage: codex-room start [--backend-port 3001] [--host 0.0.0.0] [--room <id>]');
   console.log('If --room is omitted, a new room id is generated automatically.');
   console.log('start serves already built frontend from backend (single process).');
 }
@@ -83,7 +83,7 @@ function runStart(options: StartOptions) {
   const frontendDist = resolve(repoRoot, 'frontend/dist');
   const indexPath = resolve(frontendDist, 'index.html');
   if (!existsSync(indexPath)) {
-    console.error('frontend/dist not found. Build it manually: `bun run --cwd frontend build` (from nlk-agents repo).');
+    console.error('frontend/dist not found. Build it manually: `bun run --cwd frontend build` (from codex-room repo).');
     process.exit(1);
   }
 
@@ -117,7 +117,7 @@ function runStart(options: StartOptions) {
   const localUrl = `http://localhost:${options.backendPort}?room=${encodeURIComponent(roomId)}`;
   const shareUrl = `http://${ip}:${options.backendPort}?room=${encodeURIComponent(roomId)}`;
 
-  console.log(`\nNLK Agents started for: ${targetWorkdir}`);
+  console.log(`\nCodex Room started for: ${targetWorkdir}`);
   console.log(`Room: ${roomId}`);
   console.log(`Local URL: ${localUrl}`);
   console.log(`Share URL: ${shareUrl}`);
