@@ -1132,6 +1132,13 @@ function hasDiffItem(entry: LogEntry): boolean {
   return itemPatch(entry) !== null;
 }
 
+function shouldCollapseTechSegment(items: LogEntry[]): boolean {
+  if (items.length === 0) return false;
+  const onlyReasoning = items.every((item) => normalizeMeta(item).itemType === 'reasoning');
+  if (onlyReasoning && items.length <= 2) return false;
+  return true;
+}
+
 function shouldAutoExpand(items: LogEntry[]): boolean {
   return items.some(hasDiffItem);
 }
@@ -2305,8 +2312,64 @@ onUnmounted(() => {
                   <pre class="m-0 whitespace-pre-wrap font-sans text-sm leading-relaxed text-neutral-900">{{ bodyText(seg.entry) }}</pre>
                 </div>
 
-                <!-- Tech group — collapsible -->
+                <!-- Tech group -->
                 <div v-else>
+                  <div
+                    v-if="!shouldCollapseTechSegment(seg.items)"
+                    class="bg-neutral-100"
+                  >
+                    <div
+                      v-for="item in seg.items"
+                      :key="item.id"
+                      class="flex gap-3 border-b border-neutral-200 px-4 py-2 last:border-0"
+                      :class="itemRowAlignClass(item)"
+                    >
+                      <span class="w-9 shrink-0 text-right text-[9px] font-semibold uppercase tracking-wide text-neutral-400">
+                        {{ itemLabel(item) }}
+                      </span>
+                      <div class="flex-1">
+                        <DiffPatch
+                          v-if="(normalizeMeta(item).itemType === 'file_change' || normalizeMeta(item).itemType === 'turn_diff') && itemPatch(item)"
+                          :patch="itemPatch(item) || ''"
+                        />
+                        <div
+                          v-else-if="normalizeMeta(item).itemType === 'command_execution' && itemCommandExecution(item)"
+                          class="space-y-2"
+                        >
+                          <div class="flex flex-wrap items-center gap-2 rounded border border-neutral-200 bg-white px-2 py-1.5">
+                            <span class="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">command</span>
+                            <code class="min-w-0 flex-1 break-all font-mono text-[11px] text-neutral-800">{{ itemCommandExecution(item)?.command }}</code>
+                            <span
+                              v-if="itemCommandExecution(item)?.exit"
+                              class="rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 font-mono text-[10px] text-neutral-600"
+                            >exit {{ itemCommandExecution(item)?.exit }}</span>
+                          </div>
+
+                          <div v-if="itemCommandExecution(item)?.output" class="overflow-hidden rounded border border-neutral-200 bg-white">
+                            <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">output</div>
+                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ itemCommandExecution(item)?.output }}</pre>
+                          </div>
+
+                          <div v-if="itemCommandExecution(item)?.stdout" class="overflow-hidden rounded border border-neutral-200 bg-white">
+                            <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">stdout</div>
+                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ itemCommandExecution(item)?.stdout }}</pre>
+                          </div>
+
+                          <div v-if="itemCommandExecution(item)?.stderr" class="overflow-hidden rounded border border-rose-200 bg-white">
+                            <div class="border-b border-rose-200 bg-rose-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-rose-600">stderr</div>
+                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-rose-700">{{ itemCommandExecution(item)?.stderr }}</pre>
+                          </div>
+                        </div>
+                        <pre
+                          v-else
+                          class="m-0 whitespace-pre-wrap text-[12px] leading-relaxed"
+                          :class="itemTextClass(item)"
+                        >{{ itemBody(item) }}</pre>
+                      </div>
+                    </div>
+                  </div>
+
+                  <template v-else>
                   <button
                     class="flex w-full items-center gap-2 bg-neutral-100 px-4 py-2 text-left transition-colors hover:bg-neutral-200"
                     @click="toggleExpanded(seg.id, seg.items)"
@@ -2368,6 +2431,7 @@ onUnmounted(() => {
                       </div>
                     </div>
                   </div>
+                  </template>
                 </div>
 
               </template>
