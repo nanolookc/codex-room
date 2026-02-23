@@ -16,7 +16,35 @@ const initialRoomId = roomFromQuery ?? 'main';
 const roomId = ref(initialRoomId);
 const view = ref<'home' | 'chat'>(roomFromQuery ? 'chat' : 'home');
 const userId = ref(`u-${Math.random().toString(36).slice(2, 8)}`);
-const userName = ref(`user-${Math.random().toString(36).slice(2, 5)}`);
+const USER_ADJECTIVES = [
+  'Curious',
+  'Sleepy',
+  'Chaotic',
+  'Tiny',
+  'Cosmic',
+  'Sneaky',
+  'Wobbly',
+  'Spicy',
+  'Noisy',
+  'Mellow',
+  'Feral',
+  'Glitchy'
+];
+const USER_ANIMALS = [
+  'Raccoon',
+  'Dinosaur',
+  'Otter',
+  'Capybara',
+  'Lizard',
+  'Pigeon',
+  'Shark',
+  'Badger',
+  'Gecko',
+  'Yak',
+  'Mole',
+  'Falcon'
+];
+const userName = ref(generateFunUserName());
 const workingDirectory = ref<string>('');
 type CodexThreadSummary = {
   id: string;
@@ -106,14 +134,29 @@ const liveCodexItemState = new Map<string, Record<string, unknown>>();
 const latestTurnDiffPatchByTurnId = new Map<string, string>();
 const recentDebugEvents: DebugEventSnapshot[] = [];
 const MAX_DEBUG_EVENTS = 300;
-let seenRawCodexEvents = false;
-const rawCompletedItemIds = new Set<string>();
 
 const hasPrompt = computed(() => editorText.value.trim().length > 0);
 const canRun = computed(() => hasPrompt.value && !running.value);
 const canSteer = computed(() => hasPrompt.value && running.value);
 const canSubmit = computed(() => canRun.value || canSteer.value);
 const canInterrupt = computed(() => running.value);
+
+function randomPick<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function generateFunUserName(): string {
+  const adjective = randomPick(USER_ADJECTIVES);
+  const animal = randomPick(USER_ANIMALS);
+  const suffix = Math.floor(Math.random() * 90) + 10;
+  return `${adjective} ${animal} ${suffix}`;
+}
+
+function shortId(value: string | null | undefined, head = 4, tail = 5): string {
+  if (!value) return '';
+  if (value.length <= head + tail + 3) return value;
+  return `${value.slice(0, head)}***${value.slice(-tail)}`;
+}
 
 function resetCodexRuntimeState() {
   activeCodexTurnId = null;
@@ -123,8 +166,6 @@ function resetCodexRuntimeState() {
   liveCodexItemState.clear();
   latestTurnDiffPatchByTurnId.clear();
   recentDebugEvents.length = 0;
-  seenRawCodexEvents = false;
-  rawCompletedItemIds.clear();
 }
 
 function compactDebugValue(value: unknown, depth = 0): unknown {
@@ -242,9 +283,8 @@ function normalizeCodexItemType(type: unknown): string {
   return map[type] ?? type;
 }
 
-function normalizeCodexItem(item: any): Record<string, unknown> {
-  if (!item || typeof item !== 'object') return { type: 'unknown' };
-  return { ...item, type: normalizeCodexItemType(item.type) };
+function codexItemTypeForUi(item: any): string {
+  return normalizeCodexItemType(item?.type);
 }
 
 function codexItemIdFrom(value: any): string | null {
@@ -377,7 +417,7 @@ function pickRawPatchFromValue(value: unknown): string | null {
 }
 
 function extractItemRawPatch(item: Record<string, unknown>, itemType: string): string | null {
-  if (itemType !== 'file_change') return null;
+  if (itemType !== 'file_change' && itemType !== 'turn_diff') return null;
 
   const direct = pickRawPatchFromValue(item.diff ?? item.patch ?? item.unified_diff ?? item.unifiedDiff);
   if (direct) return direct;
@@ -453,6 +493,11 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
     return parts.join('\n').trim() || safeJson(item);
   }
 
+  if (itemType === 'turn_diff') {
+    const rawPatch = extractItemRawPatch(item, itemType);
+    return rawPatch && hasPatchFileHeaders(rawPatch) ? '' : safeJson(item);
+  }
+
   if (itemType === 'mcp_tool_call' || itemType === 'collab_tool_call') {
     return safeJson(item);
   }
@@ -469,8 +514,8 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
 }
 
 function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string, options: { turnId?: string | null; itemId?: string | null } = {}) {
-  const item = normalizeCodexItem(itemInput);
-  const itemType = typeof item.type === 'string' ? item.type : 'unknown';
+  const item = itemInput && typeof itemInput === 'object' ? itemInput : ({ type: 'unknown' } as Record<string, unknown>);
+  const itemType = codexItemTypeForUi(item);
   if (itemType === 'user_message') return;
   const details = codexItemDetailsText(item, itemType).trim();
   let rawPatch = extractItemRawPatch(item, itemType) ?? undefined;
@@ -1083,7 +1128,7 @@ const segmentExpansionOverrides = ref(new Map<string, boolean>());
 
 function hasDiffItem(entry: LogEntry): boolean {
   const meta = normalizeMeta(entry);
-  if (meta.itemType === 'file_change') return true;
+  if (meta.itemType === 'file_change' || meta.itemType === 'turn_diff') return true;
   return itemPatch(entry) !== null;
 }
 
@@ -1109,6 +1154,7 @@ function itemLabel(item: LogEntry): string {
     reasoning: 'think',
     command_execution: 'cmd',
     file_change: 'file',
+    turn_diff: 'turn diff',
     mcp_tool_call: 'tool',
     collab_tool_call: 'tool',
     web_search: 'web',
@@ -1170,6 +1216,7 @@ function itemTextClass(item: LogEntry): string {
   if (meta.itemType === 'reasoning') return 'text-neutral-500 italic';
   if (meta.itemType === 'command_execution') return 'font-mono text-neutral-700';
   if (meta.itemType === 'file_change') return 'font-mono text-teal-700';
+  if (meta.itemType === 'turn_diff') return 'font-mono text-sky-700';
   return 'text-neutral-700';
 }
 
@@ -1309,9 +1356,8 @@ function replayTurnsFromThreadRead(thread: any) {
     const items = Array.isArray(turn?.items) ? turn.items : [];
     for (const item of items) {
       if (!item || typeof item !== 'object') continue;
-      const normalized = normalizeCodexItem(item);
-      if (normalized.type === 'user_message') continue;
-      appendCodexItemTimeline(normalized, baseAt);
+    if (codexItemTypeForUi(item) === 'user_message') continue;
+    appendCodexItemTimeline(item as Record<string, unknown>, baseAt);
     }
     const status = typeof turn?.status === 'string' ? turn.status : 'completed';
     const endAt =
@@ -1331,15 +1377,6 @@ function replayTurnsFromThreadRead(thread: any) {
       });
     }
   }
-}
-
-function normalizeRawCodexEventItem(item: any): Record<string, unknown> {
-  if (!item || typeof item !== 'object') return { type: 'unknown' };
-  const normalized = normalizeCodexItem(item);
-  if (Array.isArray((item as any).content) && !Array.isArray((normalized as any).content)) {
-    (normalized as any).content = (item as any).content;
-  }
-  return normalized;
 }
 
 function applyCodexNotification(message: CodexRpcMessage, at: string) {
@@ -1370,13 +1407,20 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   };
 
   if (method.startsWith('codex/event/')) {
-    seenRawCodexEvents = true;
     const msg = params?.msg ?? {};
     const rawType = typeof msg?.type === 'string' ? msg.type : '';
     const rawTurnId =
       (typeof msg?.turn_id === 'string' && msg.turn_id) ||
       (typeof params?.id === 'string' && params.id) ||
       null;
+
+    if (rawType === 'item_started') {
+      ensureLiveTurnStarted();
+      const item = (msg?.item && typeof msg.item === 'object' ? msg.item : null) as Record<string, unknown> | null;
+      const itemId = codexItemIdFrom(item);
+      if (itemId && item) liveCodexItemState.set(itemId, item);
+      return;
+    }
 
     if (rawType === 'agent_message_content_delta') {
       ensureLiveTurnStarted();
@@ -1443,8 +1487,78 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       }
       if (!delta) return;
       const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
-      appendCodexTextField(state, 'aggregatedOutput', delta);
+      const itemType = codexItemTypeForUi(state);
+      if (itemType === 'file_change') appendCodexTextField(state, 'outputDelta', delta);
+      else appendCodexTextField(state, 'aggregatedOutput', delta);
       liveCodexItemState.set(itemId, state);
+      return;
+    }
+
+    if (rawType === 'exec_command_begin') {
+      ensureLiveTurnStarted();
+      const itemId = codexItemIdFrom(msg);
+      if (!itemId) return;
+      const commandArray = Array.isArray(msg?.command) ? msg.command.filter((x: unknown) => typeof x === 'string') as string[] : [];
+      const parsedCmd = Array.isArray(msg?.parsed_cmd) ? msg.parsed_cmd : Array.isArray(msg?.parsedCmd) ? msg.parsedCmd : [];
+      const commandActions = parsedCmd.map((entry: any) => ({
+        type: typeof entry?.type === 'string' ? entry.type : 'unknown',
+        command: typeof entry?.command === 'string' ? entry.command : typeof entry?.cmd === 'string' ? entry.cmd : undefined
+      }));
+      const state: Record<string, unknown> = {
+        id: itemId,
+        type: 'command_execution',
+        status: 'inProgress',
+        command: commandArray.length ? commandArray.join(' ') : msg?.command,
+        cwd: typeof msg?.cwd === 'string' ? msg.cwd : undefined,
+        processId:
+          (typeof msg?.process_id === 'string' && msg.process_id) ||
+          (typeof msg?.processId === 'string' && msg.processId) ||
+          undefined,
+        commandActions
+      };
+      liveCodexItemState.set(itemId, state);
+      return;
+    }
+
+    if (rawType === 'exec_command_end') {
+      ensureLiveTurnStarted();
+      const itemId = codexItemIdFrom(msg);
+      if (!itemId) return;
+      const base = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
+      const durationSecs = Number((msg?.duration as any)?.secs ?? 0);
+      const durationNanos = Number((msg?.duration as any)?.nanos ?? 0);
+      const durationMs =
+        Number.isFinite(durationSecs) && Number.isFinite(durationNanos)
+          ? Math.round(durationSecs * 1000 + durationNanos / 1_000_000)
+          : undefined;
+      const merged: Record<string, unknown> = {
+        ...base,
+        status: typeof msg?.status === 'string' ? msg.status : 'completed',
+        command: Array.isArray(msg?.command)
+          ? (msg.command.filter((x: unknown) => typeof x === 'string') as string[]).join(' ')
+          : (base as any).command,
+        cwd: typeof msg?.cwd === 'string' ? msg.cwd : (base as any).cwd,
+        processId:
+          (typeof msg?.process_id === 'string' && msg.process_id) ||
+          (typeof msg?.processId === 'string' && msg.processId) ||
+          (base as any).processId,
+        exitCode:
+          msg?.exit_code !== undefined ? msg.exit_code : msg?.exitCode !== undefined ? msg.exitCode : (base as any).exitCode,
+        durationMs: durationMs ?? (base as any).durationMs,
+        stdout: typeof msg?.stdout === 'string' ? msg.stdout : (base as any).stdout,
+        stderr: typeof msg?.stderr === 'string' ? msg.stderr : (base as any).stderr,
+        aggregatedOutput:
+          typeof msg?.aggregated_output === 'string'
+            ? msg.aggregated_output
+            : typeof msg?.formatted_output === 'string'
+              ? msg.formatted_output
+              : (base as any).aggregatedOutput
+      };
+      liveCodexItemState.delete(itemId);
+      appendCodexItemTimeline(merged, at, {
+        turnId: rawTurnId,
+        itemId
+      });
       return;
     }
 
@@ -1455,7 +1569,18 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
         (typeof msg?.diff === 'string' && msg.diff) ||
         '';
       if (rawTurnId && patch.trim()) latestTurnDiffPatchByTurnId.set(rawTurnId, patch);
-      patchFileChangeEntryForTurn(rawTurnId, patch, at);
+      const patched = patchFileChangeEntryForTurn(rawTurnId, patch, at);
+      if (!patched && patch.trim()) {
+        appendCodexItemTimeline(
+          {
+            type: 'turn_diff',
+            diff: patch,
+            source: 'codex.event.turn_diff'
+          },
+          at,
+          { turnId: rawTurnId }
+        );
+      }
       return;
     }
 
@@ -1484,13 +1609,12 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
 
     if (rawType === 'item_completed') {
       ensureLiveTurnStarted();
-      const item = normalizeRawCodexEventItem(msg?.item);
+      const item = (msg?.item && typeof msg.item === 'object' ? msg.item : { type: 'unknown' }) as Record<string, unknown>;
       const itemId = codexItemIdFrom(item);
       const base = itemId ? liveCodexItemState.get(itemId) : undefined;
       const merged = base ? ({ ...base, ...item } as Record<string, unknown>) : item;
       if (itemId) {
         liveCodexItemState.delete(itemId);
-        rawCompletedItemIds.add(itemId);
       }
       appendCodexItemTimeline(merged, at, {
         turnId: rawTurnId,
@@ -1555,106 +1679,18 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     return;
   }
 
-  if (method === 'item/started') {
-    ensureLiveTurnStarted();
-    const item = normalizeCodexItem(params?.item);
-    const itemId = codexItemIdFrom(item);
-    if (itemId) liveCodexItemState.set(itemId, item);
-    const itemType = typeof item.type === 'string' ? item.type : 'unknown';
-    return;
-  }
-
-  if (method === 'item/agentMessage/delta') {
-    if (seenRawCodexEvents) return;
-    ensureLiveTurnStarted();
-    const itemId = codexItemIdFrom(params);
-    const delta = params?.delta ?? params?.textDelta ?? params?.text ?? '';
-    if (itemId && typeof delta === 'string') {
-      const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'agent_message' };
-      appendCodexTextField(state, 'text', delta);
-      liveCodexItemState.set(itemId, state);
-    }
-    return;
-  }
-
-  if (method === 'item/plan/delta') {
-    if (seenRawCodexEvents) return;
-    ensureLiveTurnStarted();
-    const itemId = codexItemIdFrom(params);
-    const delta = params?.delta ?? params?.textDelta ?? params?.text ?? '';
-    if (itemId && typeof delta === 'string') {
-      const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'plan' };
-      appendCodexTextField(state, 'text', delta);
-      liveCodexItemState.set(itemId, state);
-    }
-    return;
-  }
-
-  if (method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
-    if (seenRawCodexEvents) return;
-    ensureLiveTurnStarted();
-    const itemId = codexItemIdFrom(params);
-    if (!itemId) return;
-    const delta = params?.delta ?? params?.textDelta ?? '';
-    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'reasoning' };
-    const key = method === 'item/reasoning/summaryTextDelta' ? 'summary' : 'content';
-    const nested = (state[key] ?? {}) as Record<string, unknown>;
-    appendCodexTextField(nested, 'text', delta);
-    state[key] = nested;
-    liveCodexItemState.set(itemId, state);
-    return;
-  }
-
-  if (method === 'item/commandExecution/outputDelta') {
-    if (seenRawCodexEvents) return;
-    ensureLiveTurnStarted();
-    const itemId = codexItemIdFrom(params);
-    if (!itemId) return;
-    const delta = params?.delta ?? params?.outputDelta ?? params?.output ?? '';
-    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
-    appendCodexTextField(state, 'aggregatedOutput', delta);
-    liveCodexItemState.set(itemId, state);
-    return;
-  }
-
-  if (method === 'item/fileChange/outputDelta') {
-    if (seenRawCodexEvents) return;
-    ensureLiveTurnStarted();
-    const itemId = codexItemIdFrom(params);
-    if (!itemId) return;
-    const delta = params?.delta ?? params?.outputDelta ?? params?.output ?? '';
-    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'file_change' };
-    appendCodexTextField(state, 'outputDelta', delta);
-    liveCodexItemState.set(itemId, state);
-    return;
-  }
-
-  if (method === 'item/completed') {
-    if (seenRawCodexEvents) {
-      const legacyItem = normalizeCodexItem(params?.item);
-      const legacyItemId = codexItemIdFrom(legacyItem);
-      if (legacyItemId && rawCompletedItemIds.has(legacyItemId)) return;
-    }
-    ensureLiveTurnStarted();
-    const item = normalizeCodexItem(params?.item);
-    const itemId = codexItemIdFrom(item);
-    const base = itemId ? liveCodexItemState.get(itemId) : undefined;
-    const merged = base ? ({ ...base, ...item } as Record<string, unknown>) : item;
-    if (itemId) liveCodexItemState.delete(itemId);
-    appendCodexItemTimeline(merged, at, {
-      turnId: typeof params?.turnId === 'string' ? params.turnId : null,
-      itemId
-    });
-    return;
-  }
-
-  if (method === 'turn/diff/updated') {
-    if (seenRawCodexEvents) return;
-    ensureLiveTurnStarted();
-    const patch = typeof params?.diff === 'string' ? params.diff : '';
-    const turnId = typeof params?.turnId === 'string' ? params.turnId : null;
-    if (turnId && patch.trim()) latestTurnDiffPatchByTurnId.set(turnId, patch);
-    patchFileChangeEntryForTurn(turnId, patch, at);
+  // Raw `codex/event/*` is the primary source of truth. Ignore duplicate legacy item/diff events.
+  if (
+    method === 'item/started' ||
+    method === 'item/agentMessage/delta' ||
+    method === 'item/plan/delta' ||
+    method === 'item/reasoning/summaryTextDelta' ||
+    method === 'item/reasoning/textDelta' ||
+    method === 'item/commandExecution/outputDelta' ||
+    method === 'item/fileChange/outputDelta' ||
+    method === 'item/completed' ||
+    method === 'turn/diff/updated'
+  ) {
     return;
   }
 
@@ -2169,7 +2205,8 @@ onUnmounted(() => {
             :class="running ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'"
           ></span>
           <span class="text-[13px] font-medium tracking-tight text-neutral-900">
-            {{ view === 'chat' ? roomId : 'Rooms' }}
+            <span v-if="view === 'chat'" :title="roomId">{{ shortId(roomId) }}</span>
+            <span v-else>Rooms</span>
           </span>
           <span
             v-if="workingDirectory && view === 'chat'"
@@ -2183,12 +2220,14 @@ onUnmounted(() => {
           <button
             v-if="view === 'chat'"
             type="button"
-            class="rounded-md border border-neutral-200 px-2 py-0.5 text-[11px] text-neutral-600 hover:bg-neutral-100"
+            class="inline-flex size-6 items-center justify-center rounded-md border border-neutral-200 text-[12px] text-neutral-600 hover:bg-neutral-100"
+            :title="debugCopyStatus === 'copied' ? 'Copied debug info' : debugCopyStatus === 'error' ? 'Copy debug failed' : 'Copy debug info'"
+            aria-label="Copy debug info"
             @click="copyDebugInfo"
           >
-            {{ debugCopyStatus === 'copied' ? 'Copied' : debugCopyStatus === 'error' ? 'Copy failed' : 'Copy debug' }}
+            {{ debugCopyStatus === 'copied' ? '✓' : debugCopyStatus === 'error' ? '!' : '⧉' }}
           </button>
-          <span class="text-xs text-neutral-400">{{ userName }}</span>
+          <span class="max-w-[180px] truncate text-xs text-neutral-400" :title="userName">{{ userName }}</span>
         </div>
       </div>
     </header>
@@ -2290,7 +2329,7 @@ onUnmounted(() => {
                       </span>
                       <div class="flex-1">
                         <DiffPatch
-                          v-if="normalizeMeta(item).itemType === 'file_change' && itemPatch(item)"
+                          v-if="(normalizeMeta(item).itemType === 'file_change' || normalizeMeta(item).itemType === 'turn_diff') && itemPatch(item)"
                           :patch="itemPatch(item) || ''"
                         />
                         <div
@@ -2368,7 +2407,7 @@ onUnmounted(() => {
                 :style="{ height: `${cursor.height}px`, backgroundColor: cursor.color }"
               ></span>
               <span
-                class="absolute left-1 top-0 -translate-y-full rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+                class="absolute left-1 top-0 -translate-y-full whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium leading-none text-white"
                 :style="{ backgroundColor: cursor.color }"
               >
                 {{ cursor.userName }}
