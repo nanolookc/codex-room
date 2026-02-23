@@ -59,12 +59,32 @@ export type CodexItem = {
   [key: string]: unknown;
 };
 
+export type CodexRpcMessage = {
+  id?: number | string;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: {
+    code: number;
+    message: string;
+    data?: unknown;
+  };
+};
+
 export type RoomEvent =
   | { type: 'timeline.entry'; entry: TimelineEntry }
   | { type: 'chat.message'; message: ChatMessage }
   | { type: 'editor.updated'; editor: EditorState }
   | { type: 'presence.joined'; userId: string; userName: string; at: string }
   | { type: 'presence.left'; userId: string; at: string }
+  | { type: 'codex.rpc.notification'; message: CodexRpcMessage; at: string }
+  | { type: 'codex.rpc.serverRequest'; message: CodexRpcMessage; at: string }
+  | {
+      type: 'codex.rpc.serverRequest.resolved';
+      requestId: number | string;
+      outcome: 'result' | 'error';
+      at: string;
+    }
   | {
       type: 'codex.turn.started';
       roomId: string;
@@ -95,4 +115,30 @@ export interface RunCodexInput {
   userId: string;
   userName: string;
   prompt?: string;
+}
+
+export interface SteerCodexInput {
+  userId: string;
+  userName: string;
+  prompt?: string;
+}
+
+export interface InterruptCodexInput {
+  userId?: string;
+  userName?: string;
+}
+
+export interface CodexRpcCallInput {
+  method: string;
+  params?: unknown;
+}
+
+export interface CodexRpcRespondInput {
+  requestId: number | string;
+  result?: unknown;
+  error?: {
+    code?: number;
+    message?: string;
+    data?: unknown;
+  };
 }

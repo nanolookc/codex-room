@@ -1,9 +1,15 @@
 import { Elysia, sse } from 'elysia';
 import { cors } from '@elysiajs/cors';
 import { resolve } from 'node:path';
-import type { RunCodexInput, SendMessageInput, UpdateEditorInput } from '@codex-room/shared';
+import type {
+  CodexRpcCallInput,
+  CodexRpcRespondInput,
+  SendMessageInput,
+  UpdateEditorInput
+} from '@codex-room/shared';
 import { RoomStore } from './services/room-store';
 import { CodexRunner } from './services/codex-runner';
+import { CodexRoomProxyManager } from './services/codex-room-proxy';
 import { AppLogger } from './services/logger';
 
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -19,6 +25,17 @@ const logger = new AppLogger();
 const roomStore = new RoomStore(logger, WORKING_DIRECTORY);
 const codexRunner = new CodexRunner(
   logger,
+  WORKING_DIRECTORY,
+  CODEX_MODEL,
+  CODEX_REASONING_EFFORT
+);
+const codexProxy = new CodexRoomProxyManager(
+  logger,
+  {
+    publish: (roomId, event) => roomStore.publish(roomId, event),
+    getThreadId: (roomId) => roomStore.getSnapshot(roomId).threadId,
+    setThreadId: (roomId, threadId) => roomStore.setThreadId(roomId, threadId)
+  },
   WORKING_DIRECTORY,
   CODEX_MODEL,
   CODEX_REASONING_EFFORT
@@ -88,9 +105,19 @@ const app = new Elysia()
   .get('/api/codex/threads', async ({ query }) => {
     const limit = Number(query.limit ?? 30);
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 30;
-    logger.info('codex.threads.requested', { limit: safeLimit, scope: 'room_store' });
-    const data = roomStore.listRoomThreads(safeLimit);
-    return { data };
+    logger.info('codex.threads.requested', { limit: safeLimit, scope: 'app_server' });
+    try {
+      const data = await codexRunner.listThreads(safeLimit);
+      return { data };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn('codex.threads.list.failed.fallback_room_store', {
+        limit: safeLimit,
+        error: message
+      });
+      const data = roomStore.listRoomThreads(safeLimit);
+      return { data };
+    }
   })
   .post('/api/codex/threads/start', async () => {
     const thread = await codexRunner.startThread();
@@ -102,15 +129,22 @@ const app = new Elysia()
     const input = body as { threadId?: string };
     const threadId = input.threadId?.trim();
     if (!threadId) return { ok: false, error: 'threadId is required' };
-    roomStore.setThreadId(params.roomId, threadId);
-    let imported = 0;
     try {
-      const thread = await codexRunner.readThread(threadId);
-      if (thread) {
-        imported = roomStore.hydrateFromThreadRead(params.roomId, thread, { replace: true });
-      }
+      await codexProxy.call(params.roomId, 'thread/read', { threadId, includeTurns: false });
+      roomStore.setThreadId(params.roomId, threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('outside allowed workspace scope')) {
+        logger.warn('codex.thread.hydration.scope_denied', {
+          roomId: params.roomId,
+          threadId,
+          error: message
+        });
+        return new Response(JSON.stringify({ ok: false, error: 'Thread is outside this project' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' }
+        });
+      }
       const isExpectedNewThread =
         message.includes('thread not loaded') || message.includes('no rollout found');
       logger[isExpectedNewThread ? 'debug' : 'warn']('codex.thread.hydration.failed', {
@@ -118,8 +152,11 @@ const app = new Elysia()
         threadId,
         error: message
       });
+      if (isExpectedNewThread) {
+        roomStore.setThreadId(params.roomId, threadId);
+      }
     }
-    return { ok: true, roomId: params.roomId, threadId, imported };
+    return { ok: true, roomId: params.roomId, threadId, imported: 0 };
   })
   .get('/api/rooms/:roomId/state', ({ params }) => {
     logger.info('room.state.requested', { roomId: params.roomId });
@@ -150,41 +187,47 @@ const app = new Elysia()
       selectionEnd: input.selectionEnd
     });
   })
-  .post('/api/rooms/:roomId/codex/run', async ({ params, body, set }) => {
-    const input = body as RunCodexInput;
-    const state = roomStore.getSnapshot(params.roomId);
-
-    const prompt = (input.prompt ?? state.editor.text).trim();
-    if (!prompt) return { ok: false, error: 'Prompt is empty' };
-    if (codexRunner.isRoomRunning(params.roomId)) {
-      logger.warn('codex.run.rejected.running', { roomId: params.roomId });
-      set.status = 409;
-      return { ok: false, error: 'Turn is already running for this room' };
-    }
-
-    logger.info('codex.run.requested', {
-      roomId: params.roomId,
-      userId: input.userId,
-      userName: input.userName,
-      promptLength: prompt.length,
-      hasThreadId: Boolean(state.threadId)
-    });
-
-    roomStore.addMessage(params.roomId, input.userId, input.userName, prompt);
-
-    void codexRunner
-      .runRoomTurn({
+  .post('/api/rooms/:roomId/codex/rpc', async ({ params, body, set }) => {
+    const input = body as CodexRpcCallInput;
+    try {
+      const result = await codexProxy.call(params.roomId, input.method, input.params);
+      return { ok: true, result };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status =
+        message.includes('outside allowed workspace scope')
+          ? 403
+          : message.includes('managed by the backend')
+            ? 400
+            : 500;
+      set.status = status;
+      logger.warn('codex.rpc.call.failed', {
         roomId: params.roomId,
-        prompt,
-        threadId: state.threadId,
-        onThreadId: (threadId) => roomStore.setThreadId(params.roomId, threadId),
-        publish: (event) => roomStore.publish(params.roomId, event)
-      })
-      .catch(() => {
-        // Event with failure details is already published by CodexRunner.
+        method: input?.method,
+        error: message,
+        status
       });
-
-    return { ok: true };
+      return { ok: false, error: message };
+    }
+  })
+  .post('/api/rooms/:roomId/codex/respond', async ({ params, body, set }) => {
+    const input = body as CodexRpcRespondInput;
+    try {
+      await codexProxy.respond(params.roomId, input.requestId, {
+        result: input.result,
+        error: input.error
+      });
+      return { ok: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      set.status = 400;
+      logger.warn('codex.rpc.respond.failed', {
+        roomId: params.roomId,
+        requestId: input?.requestId,
+        error: message
+      });
+      return { ok: false, error: message };
+    }
   })
   .post('/api/rooms/:roomId/events', async function* ({ params, request, set }) {
     logger.info('room.events.connected', { roomId: params.roomId });

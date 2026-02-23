@@ -1,25 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
 import type { RoomEvent } from '@codex-room/shared';
+import { AppServerSession } from './codex-app-server-session';
 import { AppLogger } from './logger';
-
-type JsonRpcError = {
-  code: number;
-  message: string;
-  data?: unknown;
-};
-
-type JsonRpcMessage = {
-  id?: number;
-  method?: string;
-  params?: any;
-  result?: any;
-  error?: JsonRpcError;
-};
-
-type NotificationHandler = (message: JsonRpcMessage) => void;
 
 export type CodexThreadSummary = {
   id: string;
@@ -35,11 +18,39 @@ export type CodexThreadRead = {
   turns: any[];
 };
 
+function normalizePathForScope(path: unknown): string | null {
+  if (typeof path !== 'string') return null;
+  const trimmed = path.trim();
+  if (!trimmed) return null;
+  try {
+    return resolve(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
+function threadCwdFromValue(thread: any): string | null {
+  if (!thread || typeof thread !== 'object') return null;
+  const candidates = [
+    thread.cwd,
+    thread.workingDirectory,
+    thread.working_directory,
+    thread.session?.cwd,
+    thread.session?.workingDirectory,
+    thread.session?.working_directory
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  }
+  return null;
+}
+
 function normalizeItemType(type: unknown): string {
   if (typeof type !== 'string') return 'unknown';
   const map: Record<string, string> = {
     userMessage: 'user_message',
     agentMessage: 'agent_message',
+    plan: 'plan',
     commandExecution: 'command_execution',
     fileChange: 'file_change',
     mcpToolCall: 'mcp_tool_call',
@@ -308,158 +319,12 @@ function loadTurnUsageFromRollout(threadId: string): Map<string, Record<string, 
   return result;
 }
 
-class AppServerSession {
-  private proc: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private pending = new Map<
-    number,
-    { resolve: (value: any) => void; reject: (error: Error) => void }
-  >();
-  private handlers = new Set<NotificationHandler>();
-
-  private constructor(
-    proc: ChildProcessWithoutNullStreams,
-    private readonly logger: AppLogger
-  ) {
-    this.proc = proc;
-    const rl = createInterface({ input: proc.stdout });
-
-    rl.on('line', (line) => {
-      if (!line.trim()) return;
-
-      let message: JsonRpcMessage;
-      try {
-        message = JSON.parse(line) as JsonRpcMessage;
-      } catch {
-        this.logger.warn('codex.app_server.invalid_json', { line });
-        return;
-      }
-
-      if (typeof message.id === 'number') {
-        const pending = this.pending.get(message.id);
-        if (!pending) return;
-        this.pending.delete(message.id);
-
-        if (message.error) {
-          pending.reject(
-            new Error(`${message.error.message} (code ${message.error.code})`)
-          );
-        } else {
-          pending.resolve(message.result);
-        }
-        return;
-      }
-
-      if (message.method) {
-        for (const handler of this.handlers) handler(message);
-      }
-    });
-
-    proc.on('exit', (code, signal) => {
-      const reason = `app-server exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
-      for (const [id, pending] of this.pending) {
-        pending.reject(new Error(reason));
-        this.pending.delete(id);
-      }
-    });
-
-    proc.on('error', (error) => {
-      const reason = `app-server spawn error: ${error.message}`;
-      for (const [id, pending] of this.pending) {
-        pending.reject(new Error(reason));
-        this.pending.delete(id);
-      }
-    });
-
-    proc.stderr.on('data', (chunk) => {
-      const text = chunk.toString();
-      const trimmed = text.trim();
-      if (!trimmed) return;
-      if (trimmed.includes('state db missing rollout path for thread')) {
-        this.logger.debug('codex.app_server.stderr.rollout_missing_path');
-        return;
-      }
-      this.logger.debug('codex.app_server.stderr', { text: trimmed });
-    });
-  }
-
-  static async start(logger: AppLogger): Promise<AppServerSession> {
-    const proc = spawn('codex', ['app-server'], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    const session = new AppServerSession(proc, logger);
-
-    await session.request('initialize', {
-      clientInfo: {
-        name: 'codex_room',
-        title: 'Codex Room',
-        version: '0.1.0'
-      },
-      capabilities: {
-        experimentalApi: true
-      }
-    });
-    session.notify('initialized', {});
-
-    return session;
-  }
-
-  close() {
-    this.handlers.clear();
-
-    try {
-      this.proc.stdin.end();
-    } catch {
-      // ignore
-    }
-
-    if (!this.proc.killed) {
-      this.proc.kill('SIGTERM');
-      setTimeout(() => {
-        if (!this.proc.killed) this.proc.kill('SIGKILL');
-      }, 800);
-    }
-  }
-
-  onNotification(handler: NotificationHandler): () => void {
-    this.handlers.add(handler);
-    return () => this.handlers.delete(handler);
-  }
-
-  request(method: string, params?: unknown): Promise<any> {
-    const id = this.nextId++;
-    const payload = { method, id, ...(params ? { params } : {}) };
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        reject(new Error(`app-server request timeout: ${method}`));
-      }, 30000);
-
-      const wrappedResolve = (value: any) => {
-        clearTimeout(timer);
-        resolve(value);
-      };
-      const wrappedReject = (error: Error) => {
-        clearTimeout(timer);
-        reject(error);
-      };
-
-      this.pending.set(id, { resolve: wrappedResolve, reject: wrappedReject });
-      this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
-    });
-  }
-
-  notify(method: string, params?: unknown) {
-    const payload = { method, ...(params ? { params } : {}) };
-    this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
-  }
-}
-
 export class CodexRunner {
   private runningRooms = new Set<string>();
+  private activeTurns = new Map<
+    string,
+    { session: AppServerSession; threadId: string; turnId: string | null }
+  >();
   constructor(
     private readonly logger: AppLogger,
     private readonly workingDirectory?: string,
@@ -471,13 +336,97 @@ export class CodexRunner {
     return this.runningRooms.has(roomId);
   }
 
+  private getActiveTurn(roomId: string) {
+    return this.activeTurns.get(roomId) ?? null;
+  }
+
+  async steerRoomTurn(params: { roomId: string; prompt: string }): Promise<{ turnId: string }> {
+    const active = this.getActiveTurn(params.roomId);
+    if (!active) throw new Error('No active turn for this room');
+    if (!active.turnId) throw new Error('Turn is starting; try again in a moment');
+
+    const result = await active.session.request('turn/steer', {
+      threadId: active.threadId,
+      input: [{ type: 'text', text: params.prompt }],
+      expectedTurnId: active.turnId
+    });
+
+    const turnId = typeof result?.turnId === 'string' ? result.turnId : active.turnId;
+    return { turnId };
+  }
+
+  async interruptRoomTurn(params: { roomId: string }): Promise<void> {
+    const active = this.getActiveTurn(params.roomId);
+    if (!active) throw new Error('No active turn for this room');
+    if (!active.turnId) throw new Error('Turn is starting; try again in a moment');
+
+    await active.session.request('turn/interrupt', {
+      threadId: active.threadId,
+      turnId: active.turnId
+    });
+  }
+
+  private allowedWorkspaceRoot(): string | null {
+    return normalizePathForScope(this.workingDirectory);
+  }
+
+  private threadBelongsToWorkspace(thread: any): boolean {
+    const allowed = this.allowedWorkspaceRoot();
+    if (!allowed) return true;
+
+    const threadCwd = normalizePathForScope(threadCwdFromValue(thread));
+    if (!threadCwd) return false;
+    return threadCwd === allowed;
+  }
+
+  private scopeError(threadId: string, threadCwd?: string | null): Error {
+    const allowed = this.allowedWorkspaceRoot();
+    const suffix =
+      allowed || threadCwd
+        ? ` (thread cwd: ${threadCwd ?? 'unknown'}, allowed cwd: ${allowed ?? 'unset'})`
+        : '';
+    return new Error(`Thread is outside allowed workspace scope${suffix}`);
+  }
+
+  private async readThreadRaw(
+    session: AppServerSession,
+    threadId: string,
+    includeTurns: boolean
+  ): Promise<any | null> {
+    const response = await session.request('thread/read', {
+      threadId,
+      includeTurns
+    });
+    const thread = response?.thread;
+    return thread && typeof thread === 'object' ? thread : null;
+  }
+
+  private async assertThreadScope(session: AppServerSession, threadId: string): Promise<void> {
+    const allowed = this.allowedWorkspaceRoot();
+    if (!allowed) return;
+
+    const thread = await this.readThreadRaw(session, threadId, false);
+    if (!thread) return;
+
+    if (!this.threadBelongsToWorkspace(thread)) {
+      const threadCwd = threadCwdFromValue(thread);
+      this.logger.warn('codex.thread.scope.denied', {
+        threadId,
+        threadCwd: threadCwd ?? undefined,
+        allowedCwd: allowed
+      });
+      throw this.scopeError(threadId, threadCwd);
+    }
+  }
+
   async listThreads(limit = 30): Promise<CodexThreadSummary[]> {
     const session = await AppServerSession.start(this.logger);
     try {
       const response = await session.request('thread/list', {
         limit,
         sortKey: 'updated_at',
-        sourceKinds: ['appServer', 'cli', 'vscode']
+        sourceKinds: ['appServer', 'cli', 'vscode'],
+        ...(this.workingDirectory ? { cwd: this.workingDirectory } : {})
       });
       const data = Array.isArray(response?.data) ? response.data : [];
 
@@ -543,12 +492,11 @@ export class CodexRunner {
   async readThread(threadId: string): Promise<CodexThreadRead | null> {
     const session = await AppServerSession.start(this.logger);
     try {
-      const response = await session.request('thread/read', {
-        threadId,
-        includeTurns: true
-      });
-      const thread = response?.thread;
-      if (!thread || typeof thread !== 'object') return null;
+      const thread = await this.readThreadRaw(session, threadId, true);
+      if (!thread) return null;
+      if (!this.threadBelongsToWorkspace(thread)) {
+        throw this.scopeError(threadId, threadCwdFromValue(thread));
+      }
       const id = typeof thread.id === 'string' ? thread.id : threadId;
       const turnsRaw = Array.isArray(thread.turns) ? thread.turns : [];
       const rolloutUsageByTurnId = loadTurnUsageFromRollout(id);
@@ -604,6 +552,7 @@ export class CodexRunner {
       let threadId = params.threadId;
 
       if (threadId) {
+        await this.assertThreadScope(session, threadId);
         let resumed: any = null;
         let resumeError: string | null = null;
         try {
@@ -661,6 +610,12 @@ export class CodexRunner {
       if (!threadId) throw new Error('Failed to start or resume thread');
       if (params.onThreadId) params.onThreadId(threadId);
 
+      this.activeTurns.set(params.roomId, {
+        session,
+        threadId,
+        turnId: null
+      });
+
       params.publish({
         type: 'codex.turn.started',
         roomId: params.roomId,
@@ -678,11 +633,80 @@ export class CodexRunner {
 
       const turnId = turnResult?.turn?.id;
       if (!turnId) throw new Error('Failed to start turn');
+      this.activeTurns.set(params.roomId, {
+        session,
+        threadId,
+        turnId
+      });
 
       let lastAgentMessageText = '';
       let latestUsage: any = null;
       const itemState = new Map<string, Record<string, unknown>>();
       const startedPublished = new Set<string>();
+      const offServerRequests = session.onRequest((message) => {
+        const method = message.method ?? '';
+        const paramsAny = message.params ?? {};
+
+        if (
+          method === 'item/commandExecution/requestApproval' ||
+          method === 'item/fileChange/requestApproval'
+        ) {
+          const itemId = itemIdFrom(paramsAny) ?? undefined;
+          this.logger.info('codex.approval.auto_accepted', {
+            roomId: params.roomId,
+            threadId: eventThreadIdFrom(paramsAny) ?? threadId,
+            turnId: typeof paramsAny?.turnId === 'string' ? paramsAny.turnId : undefined,
+            itemId,
+            method
+          });
+          params.publish({
+            type: 'codex.item.completed',
+            item: normalizeItem({
+              type:
+                method === 'item/fileChange/requestApproval' ? 'fileChange' : 'commandExecution',
+              id: itemId,
+              status: 'awaiting_approval',
+              approval: {
+                decision: 'acceptForSession',
+                source: 'auto',
+                method
+              }
+            }),
+            at: new Date().toISOString()
+          });
+          return { handled: true, result: 'acceptForSession' } as const;
+        }
+
+        if (method === 'tool/requestUserInput') {
+          this.logger.warn('codex.tool.request_user_input.unsupported', {
+            roomId: params.roomId,
+            threadId: eventThreadIdFrom(paramsAny) ?? threadId,
+            payload: safeJsonSnippet(paramsAny)
+          });
+          return {
+            handled: true,
+            error: {
+              code: -32601,
+              message: 'tool/requestUserInput is not supported by this client'
+            }
+          } as const;
+        }
+
+        if (method === 'account/chatgptAuthTokens/refresh') {
+          this.logger.warn('codex.auth.external_tokens_refresh.unsupported', {
+            roomId: params.roomId
+          });
+          return {
+            handled: true,
+            error: {
+              code: -32601,
+              message: 'Externally-managed ChatGPT token refresh is not supported'
+            }
+          } as const;
+        }
+
+        return undefined;
+      });
 
       await new Promise<void>((resolve, reject) => {
         const off = session.onNotification((message) => {
@@ -763,6 +787,16 @@ export class CodexRunner {
             return;
           }
 
+          if (method === 'item/plan/delta') {
+            const id = itemIdFrom(paramsAny);
+            if (!id) return;
+            const delta = paramsAny.delta ?? paramsAny.textDelta ?? paramsAny.text ?? '';
+            const state = itemState.get(id) ?? { id, type: 'plan' };
+            appendTextField(state, 'text', delta);
+            itemState.set(id, state);
+            return;
+          }
+
           if (method === 'item/reasoning/summaryTextDelta') {
             const id = itemIdFrom(paramsAny);
             if (!id) return;
@@ -822,6 +856,42 @@ export class CodexRunner {
             return;
           }
 
+          if (method === 'turn/plan/updated') {
+            const eventTurnId = paramsAny.turnId;
+            if (eventTurnId && eventTurnId !== turnId) return;
+            const plan = Array.isArray(paramsAny.plan) ? paramsAny.plan : [];
+            const explanation =
+              typeof paramsAny.explanation === 'string' ? paramsAny.explanation.trim() : '';
+            const planText = plan
+              .map((entry: any, index: number) => {
+                const step =
+                  typeof entry?.step === 'string' && entry.step.trim()
+                    ? entry.step.trim()
+                    : `Step ${index + 1}`;
+                const rawStatus = typeof entry?.status === 'string' ? entry.status : 'pending';
+                const status =
+                  rawStatus === 'inProgress'
+                    ? 'in_progress'
+                    : rawStatus === 'completed' || rawStatus === 'pending'
+                      ? rawStatus
+                      : rawStatus;
+                return `${index + 1}. [${status}] ${step}`;
+              })
+              .join('\n');
+            params.publish({
+              type: 'codex.item.completed',
+              item: normalizeItem({
+                type: 'plan',
+                id: `plan-${turnId}`,
+                text: [explanation, planText].filter(Boolean).join('\n'),
+                explanation: paramsAny.explanation,
+                plan
+              }),
+              at: new Date().toISOString()
+            });
+            return;
+          }
+
           if (method === 'model/rerouted') {
             params.publish({
               type: 'codex.item.completed',
@@ -841,6 +911,7 @@ export class CodexRunner {
             const turn = paramsAny.turn;
             if (!turn || turn.id !== turnId) return;
 
+            offServerRequests();
             off();
 
             const status = turn.status ?? 'completed';
@@ -910,6 +981,9 @@ export class CodexRunner {
       }
       throw error;
     } finally {
+      this.activeTurns.delete(params.roomId);
+      // request handlers are cleared in close(), but explicit close ordering keeps
+      // any late server-initiated requests from being handled against stale state.
       session.close();
       this.runningRooms.delete(params.roomId);
       this.logger.info('codex.turn.queue.leave', { roomId: params.roomId });
