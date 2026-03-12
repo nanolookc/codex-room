@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import MarkdownIt from 'markdown-it';
 import type {
   CodexRpcMessage,
   EditorCursor,
@@ -7,6 +8,22 @@ import type {
   TimelineEntry
 } from '@codex-room/shared';
 import DiffPatch from './components/DiffPatch.vue';
+
+const markdown = new MarkdownIt({
+  html: false,
+  breaks: true,
+  linkify: true
+});
+
+const defaultLinkOpen =
+  markdown.renderer.rules.link_open ??
+  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+
+markdown.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx]?.attrSet('target', '_blank');
+  tokens[idx]?.attrSet('rel', 'noopener noreferrer');
+  return defaultLinkOpen(tokens, idx, options, env, self);
+};
 
 const query = new URLSearchParams(window.location.search);
 const API = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
@@ -118,10 +135,17 @@ type UsageDisplay = {
   cachedInput?: number;
   contextAvailablePercent?: number;
 };
+type EffortOption = {
+  id: string;
+  label: string;
+  description?: string;
+};
 type ModelOption = {
   id: string;
   label: string;
   isDefault?: boolean;
+  effortOptions?: EffortOption[];
+  defaultEffort?: string;
 };
 type AccessMode = 'full-access' | 'need-approve';
 const usageByTurnAt = ref(new Map<string, UsageDisplay>());
@@ -131,9 +155,11 @@ const debugCopyStatus = ref<'idle' | 'copied' | 'error'>('idle');
 const apiError = ref<string | null>(null);
 const modelOptions = ref<ModelOption[]>([]);
 const selectedModel = ref('default');
+const selectedEffort = ref('medium');
 const accessMode = ref<AccessMode>('full-access');
-const openMenu = ref<'model' | 'access' | null>(null);
+const openMenu = ref<'model' | 'effort' | 'access' | null>(null);
 const modelMenuEl = ref<HTMLElement | null>(null);
+const effortMenuEl = ref<HTMLElement | null>(null);
 const accessMenuEl = ref<HTMLElement | null>(null);
 
 let eventsAbortController: AbortController | null = null;
@@ -156,6 +182,22 @@ const canInterrupt = computed(() => running.value);
 const defaultModelOption = computed(() =>
   modelOptions.value.find((option) => option.isDefault && option.id !== 'default') ?? null
 );
+const activeModelOption = computed(() => {
+  if (selectedModel.value === 'default') {
+    return defaultModelOption.value ?? modelOptions.value.find((option) => option.id === 'default') ?? null;
+  }
+  return modelOptions.value.find((option) => option.id === selectedModel.value) ?? defaultModelOption.value ?? null;
+});
+const fallbackEffortOptions: EffortOption[] = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' }
+];
+const effortOptions = computed(() => {
+  const options = activeModelOption.value?.effortOptions ?? [];
+  if (options.length > 0) return options;
+  return fallbackEffortOptions;
+});
 const selectedModelOptionLabel = computed(() => {
   if (selectedModel.value === 'default') {
     if (defaultModelOption.value?.label) return defaultModelOption.value.label;
@@ -164,8 +206,23 @@ const selectedModelOptionLabel = computed(() => {
   }
   return modelOptions.value.find((option) => option.id === selectedModel.value)?.label ?? selectedModel.value;
 });
+const selectedEffortLabel = computed(() => {
+  return effortOptions.value.find((option) => option.id === selectedEffort.value)?.label ?? selectedEffort.value;
+});
 const selectedAccessLabel = computed(() =>
   accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
+);
+
+watch(
+  [selectedModel, modelOptions],
+  () => {
+    if (effortOptions.value.some((option) => option.id === selectedEffort.value)) return;
+    selectedEffort.value =
+      activeModelOption.value?.defaultEffort ??
+      effortOptions.value[0]?.id ??
+      'medium';
+  },
+  { immediate: true }
 );
 
 function randomPick<T>(items: T[]): T {
@@ -843,6 +900,10 @@ function badgeClass(entry: LogEntry): string {
   return 'bg-neutral-100 text-neutral-500';
 }
 
+function renderMarkdown(text: string): string {
+  return markdown.render(text);
+}
+
 function itemRawBodyText(entry: LogEntry): string {
   if (!entry.text.startsWith('Item:')) return entry.text;
   return entry.text.split('\n').slice(1).join('\n').trim() || '(no details)';
@@ -1379,7 +1440,7 @@ function approvalPolicyForMode(mode: AccessMode): string {
   return mode === 'full-access' ? 'never' : 'unlessTrusted';
 }
 
-function toggleMenu(menu: 'model' | 'access') {
+function toggleMenu(menu: 'model' | 'effort' | 'access') {
   openMenu.value = openMenu.value === menu ? null : menu;
 }
 
@@ -1389,6 +1450,11 @@ function closeMenus() {
 
 function selectModelOption(optionId: string) {
   selectedModel.value = optionId;
+  closeMenus();
+}
+
+function selectEffortOption(optionId: string) {
+  selectedEffort.value = optionId;
   closeMenus();
 }
 
@@ -2148,6 +2214,9 @@ async function loadRuntime() {
   workingDirectory.value = data.workingDirectory ?? '';
   const runtimeModel = typeof data.codexModel === 'string' ? data.codexModel : 'default';
   selectedModel.value = runtimeModel && runtimeModel !== 'default' ? runtimeModel : 'default';
+  if (typeof data.codexReasoningEffort === 'string' && data.codexReasoningEffort.trim()) {
+    selectedEffort.value = data.codexReasoningEffort;
+  }
 }
 
 async function loadCodexThreads() {
@@ -2168,13 +2237,34 @@ async function loadModels() {
       .map((entry: any) => {
         const id = typeof entry?.id === 'string' ? entry.id : '';
         if (!id) return null;
+        const effortOptions = Array.isArray(entry?.reasoningEffort)
+          ? entry.reasoningEffort
+              .map((effortEntry: any) => {
+                const effortId = typeof effortEntry?.effort === 'string' ? effortEntry.effort : '';
+                if (!effortId) return null;
+                return {
+                  id: effortId,
+                  label: effortId.charAt(0).toUpperCase() + effortId.slice(1),
+                  description:
+                    typeof effortEntry?.description === 'string' && effortEntry.description.trim()
+                      ? effortEntry.description.trim()
+                      : undefined
+                } satisfies EffortOption;
+              })
+              .filter((effortEntry: EffortOption | null): effortEntry is EffortOption => Boolean(effortEntry))
+          : [];
         return {
           id,
           label:
             (typeof entry?.displayName === 'string' && entry.displayName.trim()) ||
             (typeof entry?.model === 'string' && entry.model.trim()) ||
             id,
-          isDefault: Boolean(entry?.isDefault)
+          isDefault: Boolean(entry?.isDefault),
+          effortOptions,
+          defaultEffort:
+            typeof entry?.defaultReasoningEffort === 'string' && entry.defaultReasoningEffort.trim()
+              ? entry.defaultReasoningEffort
+              : undefined
         } satisfies ModelOption;
       })
       .filter((entry: ModelOption | null): entry is ModelOption => Boolean(entry));
@@ -2185,7 +2275,12 @@ async function loadModels() {
 
     const withDefault =
       selectedModel.value === 'default' || !options.some((entry) => entry.id === selectedModel.value)
-        ? [{ id: 'default', label: defaultPickerLabel }, ...options]
+        ? [{
+            id: 'default',
+            label: defaultPickerLabel,
+            effortOptions: defaultVisibleOption?.effortOptions ?? [],
+            defaultEffort: defaultVisibleOption?.defaultEffort
+          }, ...options]
         : options;
 
     modelOptions.value = withDefault;
@@ -2193,7 +2288,7 @@ async function loadModels() {
       selectedModel.value = withDefault[0]?.id ?? 'default';
     }
   } catch {
-    modelOptions.value = [{ id: 'default', label: 'Project Default', isDefault: true }];
+    modelOptions.value = [{ id: 'default', label: 'Project Default', isDefault: true, effortOptions: fallbackEffortOptions, defaultEffort: 'medium' }];
   }
 }
 
@@ -2463,6 +2558,7 @@ function onWindowPointerDown(event: PointerEvent) {
   const target = event.target;
   if (!(target instanceof Node)) return;
   if (modelMenuEl.value?.contains(target)) return;
+  if (effortMenuEl.value?.contains(target)) return;
   if (accessMenuEl.value?.contains(target)) return;
   closeMenus();
 }
@@ -2495,6 +2591,7 @@ async function runCodex() {
     threadId: currentThreadId.value,
     input: [{ type: 'text', text: prompt }],
     ...(selectedModel.value !== 'default' ? { model: selectedModel.value } : {}),
+    ...(selectedEffort.value ? { effort: selectedEffort.value } : {}),
     approvalPolicy: approvalPolicyForMode(accessMode.value),
     sandboxPolicy: sandboxPolicyForMode(accessMode.value)
   });
@@ -2721,7 +2818,10 @@ onUnmounted(() => {
 
                 <!-- Agent message — always visible -->
                 <div v-if="seg.type === 'message'" class="px-4 py-3">
-                  <pre class="m-0 whitespace-pre-wrap font-sans text-sm leading-relaxed text-neutral-900">{{ bodyText(seg.entry) }}</pre>
+                  <div
+                    class="markdown-body text-sm leading-relaxed text-neutral-900"
+                    v-html="renderMarkdown(bodyText(seg.entry))"
+                  ></div>
                 </div>
 
                 <!-- Tech group -->
@@ -2858,46 +2958,46 @@ onUnmounted(() => {
     <!-- Input -->
     <footer v-if="view === 'chat'" class="shrink-0 border-t border-neutral-200 bg-white/95 backdrop-blur-sm">
       <div class="px-5 py-4">
-        <div class="space-y-3">
+        <div class="rounded-2xl border border-neutral-300 bg-white px-3 py-3">
           <div class="relative">
-          <textarea
-            ref="editorEl"
-            v-model="editorText"
-            rows="5"
-            class="w-full resize-none rounded-xl border border-neutral-200 bg-neutral-50 px-4 pb-4 pt-3 font-sans text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-300 focus:border-neutral-400 focus:bg-white"
-            placeholder="Write a prompt..."
-            @keydown="onEditorKeydown"
-            @click="onEditorSelectionChange"
-            @keyup="onEditorSelectionChange"
-            @select="onEditorSelectionChange"
-            @scroll="onEditorScroll"
-          />
-          <div class="pointer-events-none absolute inset-0 z-10 overflow-visible rounded-xl">
-            <div
-              v-for="cursor in cursorOverlays"
-              :key="cursor.userId"
-              class="absolute"
-              :style="{ left: `${cursor.left}px`, top: `${cursor.top}px` }"
-            >
-              <span
-                class="absolute left-0 top-0 w-0.5 rounded-full"
-                :style="{ height: `${cursor.height}px`, backgroundColor: cursor.color }"
-              ></span>
-              <span
-                class="absolute left-1 top-0 -translate-y-full whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium leading-none text-white"
-                :style="{ backgroundColor: cursor.color }"
+            <textarea
+              ref="editorEl"
+              v-model="editorText"
+              rows="5"
+              class="w-full resize-none border-0 bg-transparent px-0 pb-3 pt-0 font-sans text-sm text-neutral-900 outline-none placeholder:text-neutral-300"
+              placeholder="Write a prompt..."
+              @keydown="onEditorKeydown"
+              @click="onEditorSelectionChange"
+              @keyup="onEditorSelectionChange"
+              @select="onEditorSelectionChange"
+              @scroll="onEditorScroll"
+            />
+            <div class="pointer-events-none absolute inset-0 z-10 overflow-visible rounded-xl">
+              <div
+                v-for="cursor in cursorOverlays"
+                :key="cursor.userId"
+                class="absolute"
+                :style="{ left: `${cursor.left}px`, top: `${cursor.top}px` }"
               >
-                {{ cursor.userName }}
-              </span>
+                <span
+                  class="absolute left-0 top-0 w-0.5 rounded-full"
+                  :style="{ height: `${cursor.height}px`, backgroundColor: cursor.color }"
+                ></span>
+                <span
+                  class="absolute left-1 top-0 -translate-y-full whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium leading-none text-white"
+                  :style="{ backgroundColor: cursor.color }"
+                >
+                  {{ cursor.userName }}
+                </span>
+              </div>
             </div>
           </div>
-          </div>
-          <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+          <div class="flex flex-col gap-3 border-t border-neutral-200 pt-3">
+            <div class="flex flex-wrap items-center gap-2">
               <div ref="modelMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[13rem] items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-[12px] text-neutral-800 shadow-sm transition-colors hover:bg-neutral-50"
+                  class="inline-flex min-w-[12rem] items-center justify-between gap-3 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
                   @click="toggleMenu('model')"
                 >
                   <span class="truncate">{{ selectedModelOptionLabel }}</span>
@@ -2905,7 +3005,7 @@ onUnmounted(() => {
                 </button>
                 <div
                   v-if="openMenu === 'model'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[18rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-xl"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[18rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white"
                 >
                   <button
                     v-for="option in modelOptions"
@@ -2919,10 +3019,35 @@ onUnmounted(() => {
                   </button>
                 </div>
               </div>
+              <div ref="effortMenuEl" class="relative">
+                <button
+                  type="button"
+                  class="inline-flex min-w-[8rem] items-center justify-between gap-3 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  @click="toggleMenu('effort')"
+                >
+                  <span class="truncate">{{ selectedEffortLabel }}</span>
+                  <span class="text-[10px] text-neutral-400">{{ openMenu === 'effort' ? '▴' : '▾' }}</span>
+                </button>
+                <div
+                  v-if="openMenu === 'effort'"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[14rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white"
+                >
+                  <button
+                    v-for="option in effortOptions"
+                    :key="option.id"
+                    type="button"
+                    class="flex w-full items-center justify-between gap-3 border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
+                    @click="selectEffortOption(option.id)"
+                  >
+                    <span class="truncate">{{ option.label }}</span>
+                    <span v-if="selectedEffort === option.id" class="text-[10px] text-neutral-400">current</span>
+                  </button>
+                </div>
+              </div>
               <div ref="accessMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[11rem] items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-[12px] text-neutral-800 shadow-sm transition-colors hover:bg-neutral-50"
+                  class="inline-flex min-w-[10rem] items-center justify-between gap-3 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
                   @click="toggleMenu('access')"
                 >
                   <span class="truncate">{{ selectedAccessLabel }}</span>
@@ -2930,7 +3055,7 @@ onUnmounted(() => {
                 </button>
                 <div
                   v-if="openMenu === 'access'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[14rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-xl"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[14rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white"
                 >
                   <button
                     type="button"
@@ -2951,30 +3076,30 @@ onUnmounted(() => {
                 </div>
               </div>
             </div>
-            <div class="flex items-center justify-between gap-3 sm:justify-end">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span class="text-[11px] text-neutral-400">
                 {{ contextAvailabilityText }}
               </span>
               <div class="flex items-center gap-2">
-            <button
-              v-if="running"
-              :disabled="!canInterrupt"
-              @click="interruptCodex"
-              class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
-            >
-              Stop
-            </button>
-            <button
-              :disabled="!canSubmit"
-              @click="sendToCodex"
-              class="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-25"
-            >
-            <span
-              v-if="running"
-              class="size-[10px] animate-spin rounded-full border-[1.5px] border-white/30 border-t-white"
-            ></span>
-              {{ running ? 'Steer' : 'Run' }}
-            </button>
+                <button
+                  v-if="running"
+                  :disabled="!canInterrupt"
+                  @click="interruptCodex"
+                  class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  Stop
+                </button>
+                <button
+                  :disabled="!canSubmit"
+                  @click="sendToCodex"
+                  class="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-25"
+                >
+                  <span
+                    v-if="running"
+                    class="size-[10px] animate-spin rounded-full border-[1.5px] border-white/30 border-t-white"
+                  ></span>
+                  {{ running ? 'Steer' : 'Run' }}
+                </button>
               </div>
             </div>
           </div>
@@ -2984,3 +3109,68 @@ onUnmounted(() => {
 
   </div>
 </template>
+
+<style scoped>
+:deep(.markdown-body) {
+  color: inherit;
+}
+
+:deep(.markdown-body > :first-child) {
+  margin-top: 0;
+}
+
+:deep(.markdown-body > :last-child) {
+  margin-bottom: 0;
+}
+
+:deep(.markdown-body p),
+:deep(.markdown-body ul),
+:deep(.markdown-body ol),
+:deep(.markdown-body pre),
+:deep(.markdown-body blockquote) {
+  margin: 0 0 0.75rem;
+}
+
+:deep(.markdown-body ul),
+:deep(.markdown-body ol) {
+  padding-left: 1.25rem;
+}
+
+:deep(.markdown-body li + li) {
+  margin-top: 0.2rem;
+}
+
+:deep(.markdown-body code) {
+  border-radius: 0.375rem;
+  background: #f5f5f4;
+  padding: 0.1rem 0.35rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92em;
+}
+
+:deep(.markdown-body pre) {
+  overflow-x: auto;
+  border-radius: 0.75rem;
+  background: #111827;
+  padding: 0.85rem 1rem;
+  color: #f3f4f6;
+}
+
+:deep(.markdown-body pre code) {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+:deep(.markdown-body a) {
+  color: #0f766e;
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
+
+:deep(.markdown-body blockquote) {
+  border-left: 3px solid #d4d4d4;
+  padding-left: 0.9rem;
+  color: #525252;
+}
+</style>
