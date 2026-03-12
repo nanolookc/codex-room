@@ -143,6 +143,7 @@ type EffortOption = {
 type ModelOption = {
   id: string;
   label: string;
+  description?: string;
   isDefault?: boolean;
   effortOptions?: EffortOption[];
   defaultEffort?: string;
@@ -155,7 +156,7 @@ const debugCopyStatus = ref<'idle' | 'copied' | 'error'>('idle');
 const apiError = ref<string | null>(null);
 const modelOptions = ref<ModelOption[]>([]);
 const selectedModel = ref('default');
-const selectedEffort = ref('medium');
+const selectedEffort = ref('');
 const accessMode = ref<AccessMode>('full-access');
 const openMenu = ref<'model' | 'effort' | 'access' | null>(null);
 const modelMenuEl = ref<HTMLElement | null>(null);
@@ -180,32 +181,22 @@ const canSteer = computed(() => hasPrompt.value && running.value);
 const canSubmit = computed(() => canRun.value || canSteer.value);
 const canInterrupt = computed(() => running.value);
 const defaultModelOption = computed(() =>
-  modelOptions.value.find((option) => option.isDefault && option.id !== 'default') ?? null
+  modelOptions.value.find((option) => option.isDefault) ?? null
 );
 const activeModelOption = computed(() => {
   if (selectedModel.value === 'default') {
-    return defaultModelOption.value ?? modelOptions.value.find((option) => option.id === 'default') ?? null;
+    return defaultModelOption.value ?? null;
   }
   return modelOptions.value.find((option) => option.id === selectedModel.value) ?? defaultModelOption.value ?? null;
 });
-const fallbackEffortOptions: EffortOption[] = [
-  { id: 'low', label: 'Low' },
-  { id: 'medium', label: 'Medium' },
-  { id: 'high', label: 'High' }
-];
-const effortOptions = computed(() => {
-  const options = activeModelOption.value?.effortOptions ?? [];
-  if (options.length > 0) return options;
-  return fallbackEffortOptions;
-});
+const effortOptions = computed(() => activeModelOption.value?.effortOptions ?? []);
 const selectedModelOptionLabel = computed(() => {
   if (selectedModel.value === 'default') {
-    if (defaultModelOption.value?.label) return defaultModelOption.value.label;
-    const fallbackLabel = modelOptions.value.find((option) => option.id === 'default')?.label ?? 'Project Default';
-    return fallbackLabel.replace(/^Default\s*[·-]\s*/u, '').trim() || 'Project Default';
+    return defaultModelOption.value?.label ?? 'Default';
   }
   return modelOptions.value.find((option) => option.id === selectedModel.value)?.label ?? selectedModel.value;
 });
+const selectedModelButtonLabel = computed(() => selectedModelOptionLabel.value.replace(/^gpt\b/u, 'GPT'));
 const selectedEffortLabel = computed(() => {
   return effortOptions.value.find((option) => option.id === selectedEffort.value)?.label ?? selectedEffort.value;
 });
@@ -220,10 +211,18 @@ watch(
     selectedEffort.value =
       activeModelOption.value?.defaultEffort ??
       effortOptions.value[0]?.id ??
-      'medium';
+      '';
   },
   { immediate: true }
 );
+
+function formatEffortLabel(value: string): string {
+  return value
+    .split(/[-_\s]+/u)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
 
 function randomPick<T>(items: T[]): T {
   return items[Math.floor(Math.random() * items.length)];
@@ -2329,28 +2328,40 @@ async function loadModels() {
       .map((entry: any) => {
         const id = typeof entry?.id === 'string' ? entry.id : '';
         if (!id) return null;
-        const effortOptions = Array.isArray(entry?.reasoningEffort)
-          ? entry.reasoningEffort
+        const effortEntries = Array.isArray(entry?.supportedReasoningEfforts)
+          ? entry.supportedReasoningEfforts
+          : Array.isArray(entry?.reasoningEffort)
+            ? entry.reasoningEffort
+            : [];
+        const effortOptions = effortEntries
               .map((effortEntry: any) => {
-                const effortId = typeof effortEntry?.effort === 'string' ? effortEntry.effort : '';
+                const effortId =
+                  typeof effortEntry?.reasoningEffort === 'string'
+                    ? effortEntry.reasoningEffort
+                    : typeof effortEntry?.effort === 'string'
+                      ? effortEntry.effort
+                      : '';
                 if (!effortId) return null;
                 return {
                   id: effortId,
-                  label: effortId.charAt(0).toUpperCase() + effortId.slice(1),
+                  label: formatEffortLabel(effortId),
                   description:
                     typeof effortEntry?.description === 'string' && effortEntry.description.trim()
                       ? effortEntry.description.trim()
                       : undefined
                 } satisfies EffortOption;
               })
-              .filter((effortEntry: EffortOption | null): effortEntry is EffortOption => Boolean(effortEntry))
-          : [];
+              .filter((effortEntry: EffortOption | null): effortEntry is EffortOption => Boolean(effortEntry));
         return {
           id,
           label:
             (typeof entry?.displayName === 'string' && entry.displayName.trim()) ||
             (typeof entry?.model === 'string' && entry.model.trim()) ||
             id,
+          description:
+            typeof entry?.description === 'string' && entry.description.trim()
+              ? entry.description.trim()
+              : undefined,
           isDefault: Boolean(entry?.isDefault),
           effortOptions,
           defaultEffort:
@@ -2360,27 +2371,12 @@ async function loadModels() {
         } satisfies ModelOption;
       })
       .filter((entry: ModelOption | null): entry is ModelOption => Boolean(entry));
-    const defaultVisibleOption = options.find((entry) => entry.isDefault) ?? null;
-    const defaultPickerLabel = defaultVisibleOption
-      ? `Default · ${defaultVisibleOption.label}`
-      : 'Project Default';
-
-    const withDefault =
-      selectedModel.value === 'default' || !options.some((entry) => entry.id === selectedModel.value)
-        ? [{
-            id: 'default',
-            label: defaultPickerLabel,
-            effortOptions: defaultVisibleOption?.effortOptions ?? [],
-            defaultEffort: defaultVisibleOption?.defaultEffort
-          }, ...options]
-        : options;
-
-    modelOptions.value = withDefault;
-    if (!withDefault.some((entry) => entry.id === selectedModel.value)) {
-      selectedModel.value = withDefault[0]?.id ?? 'default';
+    modelOptions.value = options;
+    if (selectedModel.value !== 'default' && !options.some((entry) => entry.id === selectedModel.value)) {
+      selectedModel.value = defaultModelOption.value?.id ?? 'default';
     }
   } catch {
-    modelOptions.value = [{ id: 'default', label: 'Project Default', isDefault: true, effortOptions: fallbackEffortOptions, defaultEffort: 'medium' }];
+    modelOptions.value = [];
   }
 }
 
@@ -3091,36 +3087,44 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-2 border-t border-neutral-200 pt-3">
-            <div class="flex min-w-0 flex-wrap items-center gap-2">
+            <div class="flex min-w-0 flex-wrap items-center gap-0 text-xs text-neutral-600">
               <div ref="modelMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[9rem] items-center justify-between gap-2 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  class="inline-flex items-center gap-1.5 py-1 text-left text-xs text-neutral-700 transition-colors hover:text-neutral-950"
                   @click="toggleMenu('model')"
                 >
-                  <span class="truncate">{{ selectedModelOptionLabel }}</span>
+                  <span class="truncate">{{ selectedModelButtonLabel }}</span>
                   <span class="text-[10px] text-neutral-400">{{ openMenu === 'model' ? '▴' : '▾' }}</span>
                 </button>
                 <div
                   v-if="openMenu === 'model'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[18rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 min-w-60 max-w-88 overflow-hidden rounded-md border border-neutral-200 bg-white"
                 >
                   <button
                     v-for="option in modelOptions"
                     :key="option.id"
                     type="button"
-                    class="flex w-full items-center justify-between gap-3 border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
+                    class="flex w-full items-start border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
                     @click="selectModelOption(option.id)"
                   >
-                    <span class="truncate">{{ option.label }}</span>
-                    <span v-if="selectedModel === option.id" class="text-[10px] text-neutral-400">current</span>
+                    <span class="min-w-0 flex-1">
+                      <span class="flex items-center justify-between gap-3">
+                        <span class="block truncate">{{ option.label }}</span>
+                        <span v-if="selectedModel === option.id" class="shrink-0 text-[10px] text-neutral-400">current</span>
+                      </span>
+                      <span v-if="option.description" class="mt-0.5 block text-[11px] leading-4 text-neutral-400">
+                        {{ option.description }}
+                      </span>
+                    </span>
                   </button>
                 </div>
               </div>
+              <span class="mx-3 h-4 w-px bg-neutral-200"></span>
               <div ref="effortMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[6.5rem] items-center justify-between gap-2 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  class="inline-flex items-center gap-1.5 py-1 text-left text-xs text-neutral-700 transition-colors hover:text-neutral-950"
                   @click="toggleMenu('effort')"
                 >
                   <span class="truncate">{{ selectedEffortLabel }}</span>
@@ -3128,24 +3132,32 @@ onUnmounted(() => {
                 </button>
                 <div
                   v-if="openMenu === 'effort'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[14rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 min-w-56 max-w-64 overflow-hidden rounded-md border border-neutral-200 bg-white"
                 >
                   <button
                     v-for="option in effortOptions"
                     :key="option.id"
                     type="button"
-                    class="flex w-full items-center justify-between gap-3 border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
+                    class="flex w-full items-start border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
                     @click="selectEffortOption(option.id)"
                   >
-                    <span class="truncate">{{ option.label }}</span>
-                    <span v-if="selectedEffort === option.id" class="text-[10px] text-neutral-400">current</span>
+                    <span class="min-w-0 flex-1">
+                      <span class="flex items-center justify-between gap-3">
+                        <span class="block truncate">{{ option.label }}</span>
+                        <span v-if="selectedEffort === option.id" class="shrink-0 text-[10px] text-neutral-400">current</span>
+                      </span>
+                      <span v-if="option.description" class="mt-0.5 block text-[11px] leading-4 text-neutral-400">
+                        {{ option.description }}
+                      </span>
+                    </span>
                   </button>
                 </div>
               </div>
+              <span class="mx-3 h-4 w-px bg-neutral-200"></span>
               <div ref="accessMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[8.5rem] items-center justify-between gap-2 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  class="inline-flex items-center gap-1.5 py-1 text-left text-xs text-neutral-700 transition-colors hover:text-neutral-950"
                   @click="toggleMenu('access')"
                 >
                   <span class="truncate">{{ selectedAccessLabel }}</span>
@@ -3153,7 +3165,7 @@ onUnmounted(() => {
                 </button>
                 <div
                   v-if="openMenu === 'access'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[14rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 min-w-[10rem] overflow-hidden rounded-md border border-neutral-200 bg-white"
                 >
                   <button
                     type="button"
