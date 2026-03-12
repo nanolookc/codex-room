@@ -13,6 +13,13 @@ type RoomSession = {
   session: AppServerSession;
   pendingServerRequests: Map<string, PendingServerRequest>;
   lastActiveAt: number;
+  latestUsageByTurnId: Map<string, unknown>;
+  pendingTurnStart: {
+    threadId: string | null;
+    prompt: string;
+    model?: string;
+    reasoningEffort?: string;
+  } | null;
 };
 
 type Hooks = {
@@ -55,6 +62,58 @@ function isJsonRpcError(value: unknown): value is { code: number; message: strin
     typeof (value as any).code === 'number' &&
     typeof (value as any).message === 'string'
   );
+}
+
+function normalizeCodexItemType(type: unknown): string {
+  if (typeof type !== 'string') return 'unknown';
+  const trimmed = type.trim();
+  if (!trimmed) return 'unknown';
+  return trimmed
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[\s/-]+/g, '_')
+    .toLowerCase();
+}
+
+function normalizeCodexItem(item: unknown): Record<string, unknown> | null {
+  if (!item || typeof item !== 'object') return null;
+  return {
+    ...(item as Record<string, unknown>),
+    type: normalizeCodexItemType((item as Record<string, unknown>).type)
+  };
+}
+
+function extractPromptFromInput(params: unknown): string {
+  if (!params || typeof params !== 'object') return '';
+  const input = Array.isArray((params as Record<string, unknown>).input)
+    ? ((params as Record<string, unknown>).input as unknown[])
+    : [];
+  return input
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return '';
+      return typeof (entry as Record<string, unknown>).text === 'string'
+        ? ((entry as Record<string, unknown>).text as string).trim()
+        : '';
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function extractFinalResponseFromItem(item: Record<string, unknown> | null): string {
+  if (!item) return '';
+  if (typeof item.text === 'string' && item.text.trim()) return item.text.trim();
+  const content = Array.isArray(item.content) ? item.content : [];
+  return content
+    .map((entry) => {
+      if (typeof entry === 'string') return entry.trim();
+      if (!entry || typeof entry !== 'object') return '';
+      return typeof (entry as Record<string, unknown>).text === 'string'
+        ? ((entry as Record<string, unknown>).text as string).trim()
+        : '';
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 const ALLOWED_METHODS = new Set([
@@ -122,6 +181,23 @@ export class CodexRoomProxyManager {
     const room = await this.ensureRoom(roomId);
     room.lastActiveAt = Date.now();
     const nextParams = await this.applyPolicy(roomId, room.session, method, params);
+    if (method === 'turn/start') {
+      const requestParams =
+        nextParams && typeof nextParams === 'object' && !Array.isArray(nextParams)
+          ? (nextParams as Record<string, unknown>)
+          : {};
+      room.pendingTurnStart = {
+        threadId: typeof requestParams.threadId === 'string' ? requestParams.threadId : null,
+        prompt: extractPromptFromInput(requestParams),
+        model: typeof requestParams.model === 'string' ? requestParams.model : undefined,
+        reasoningEffort:
+          typeof requestParams.effort === 'string'
+            ? requestParams.effort
+            : typeof requestParams.reasoningEffort === 'string'
+              ? requestParams.reasoningEffort
+              : undefined
+      };
+    }
     const rawResult = await room.session.request(method, nextParams);
     const result = await this.applyResultPolicy(room.session, method, rawResult);
 
@@ -172,23 +248,91 @@ export class CodexRoomProxyManager {
     const room: RoomSession = {
       session,
       pendingServerRequests: new Map(),
-      lastActiveAt: Date.now()
+      lastActiveAt: Date.now(),
+      latestUsageByTurnId: new Map(),
+      pendingTurnStart: null
     };
 
     session.onNotification((message) => {
       const method = typeof message.method === 'string' ? message.method : '';
       const params = (message.params ?? {}) as any;
+      const at = new Date().toISOString();
       if (method === 'thread/started') {
         const threadId = typeof params?.thread?.id === 'string' ? params.thread.id : null;
         if (threadId) this.hooks.setThreadId(roomId, threadId);
       }
-      if (method === 'thread/archived' || method === 'thread/unarchived') {
-        // no-op, forwarded raw below
+      if (method === 'thread/tokenUsage/updated') {
+        const turnId = typeof params?.turnId === 'string' ? params.turnId : null;
+        if (turnId) {
+          room.latestUsageByTurnId.set(turnId, params?.tokenUsage ?? params);
+        }
+      }
+      if (method === 'turn/started') {
+        const turn = params?.turn ?? {};
+        const turnId = typeof turn?.id === 'string' ? turn.id : null;
+        this.hooks.publish(roomId, {
+          type: 'codex.turn.started',
+          roomId,
+          prompt: room.pendingTurnStart?.prompt?.trim() || '(running turn)',
+          at,
+          model:
+            room.pendingTurnStart?.model ??
+            (typeof turn?.model === 'string' ? turn.model : undefined),
+          reasoningEffort:
+            room.pendingTurnStart?.reasoningEffort ??
+            (typeof turn?.effort === 'string'
+              ? turn.effort
+              : typeof turn?.reasoningEffort === 'string'
+                ? turn.reasoningEffort
+                : undefined)
+        });
+        if (turnId) room.latestUsageByTurnId.delete(turnId);
+        room.pendingTurnStart = null;
+      }
+      if (method === 'item/completed') {
+        const item = normalizeCodexItem(params?.item);
+        if (item) {
+          this.hooks.publish(roomId, {
+            type: 'codex.item.completed',
+            item,
+            at
+          });
+        }
+      }
+      if (method === 'turn/completed') {
+        const turn = params?.turn ?? {};
+        const turnId = typeof turn?.id === 'string' ? turn.id : null;
+        const status = typeof turn?.status === 'string' ? turn.status : 'completed';
+        const usage = turnId ? room.latestUsageByTurnId.get(turnId) : undefined;
+        if (turnId) room.latestUsageByTurnId.delete(turnId);
+        if (status === 'failed') {
+          this.hooks.publish(roomId, {
+            type: 'codex.turn.failed',
+            error: typeof turn?.error?.message === 'string' ? turn.error.message : 'Turn failed',
+            at
+          });
+        } else if (status === 'interrupted') {
+          this.hooks.publish(roomId, {
+            type: 'codex.turn.interrupted',
+            at
+          });
+        } else {
+          const items = Array.isArray(turn?.items) ? turn.items : [];
+          const finalAgentMessageItem = [...items]
+            .reverse()
+            .find((item) => normalizeCodexItemType((item as Record<string, unknown>)?.type) === 'agent_message');
+          this.hooks.publish(roomId, {
+            type: 'codex.turn.completed',
+            finalResponse: extractFinalResponseFromItem(normalizeCodexItem(finalAgentMessageItem)),
+            usage,
+            at
+          });
+        }
       }
       this.hooks.publish(roomId, {
         type: 'codex.rpc.notification',
         message: message as CodexRpcMessage,
-        at: new Date().toISOString()
+        at
       });
     });
 

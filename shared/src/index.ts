@@ -98,6 +98,7 @@ export type RoomEvent =
     }
   | { type: 'codex.item.completed'; item: CodexItem; at: string }
   | { type: 'codex.turn.completed'; finalResponse: string; usage?: unknown; at: string }
+  | { type: 'codex.turn.interrupted'; at: string }
   | { type: 'codex.turn.failed'; error: string; at: string };
 
 export interface SendMessageInput {
