@@ -7,12 +7,14 @@ type StartOptions = {
   backendPort: number;
   host: string;
   room?: string;
+  share: boolean;
 };
 
 function parseArgs(argv: string[]): { command: string | null; options: StartOptions } {
   const options: StartOptions = {
     backendPort: 3001,
-    host: '0.0.0.0'
+    host: '127.0.0.1',
+    share: false
   };
 
   const [command, ...rest] = argv;
@@ -30,6 +32,12 @@ function parseArgs(argv: string[]): { command: string | null; options: StartOpti
     if ((arg === '--host' || arg === '-h') && next) {
       options.host = next;
       i++;
+      continue;
+    }
+
+    if (arg === '--share') {
+      options.share = true;
+      options.host = '0.0.0.0';
       continue;
     }
 
@@ -58,8 +66,9 @@ function getPrimaryIp(): string {
 }
 
 function printUsage() {
-  console.log('Usage: codex-room start [--backend-port 3001] [--host 0.0.0.0] [--room <id>]');
+  console.log('Usage: codex-room start [--backend-port 3001] [--host 127.0.0.1] [--share] [--room <id>]');
   console.log('If --room is omitted, a new room id is generated automatically.');
+  console.log('A new session key is generated on each start and is required for all room API calls.');
   console.log('start serves already built frontend from backend (single process).');
 }
 
@@ -87,6 +96,12 @@ function runStart(options: StartOptions) {
     process.exit(1);
   }
 
+  const sessionKey =
+    (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+    ).replace(/-/g, '');
+
   const backendProc = Bun.spawn([
     'bun',
     'run',
@@ -100,6 +115,7 @@ function runStart(options: StartOptions) {
       HOST: options.host,
       PORT: String(options.backendPort),
       NLK_WORKDIR: targetWorkdir,
+      NLK_SESSION_KEY: sessionKey,
       NLK_SERVE_FRONTEND: '1',
       NLK_FRONTEND_DIST: frontendDist
     },
@@ -114,13 +130,19 @@ function runStart(options: StartOptions) {
     (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `room-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
-  const localUrl = `http://localhost:${options.backendPort}?room=${encodeURIComponent(roomId)}`;
-  const shareUrl = `http://${ip}:${options.backendPort}?room=${encodeURIComponent(roomId)}`;
+  const query = `room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(sessionKey)}`;
+  const localUrl = `http://localhost:${options.backendPort}?${query}`;
+  const shareUrl = `http://${ip}:${options.backendPort}?${query}`;
 
   console.log(`\nCodex Room started for: ${targetWorkdir}`);
   console.log(`Room: ${roomId}`);
+  console.log(`Session Key: ${sessionKey}`);
   console.log(`Local URL: ${localUrl}`);
-  console.log(`Share URL: ${shareUrl}`);
+  if (options.share) {
+    console.log(`Share URL: ${shareUrl}`);
+  } else {
+    console.log('LAN share is disabled by default. Re-run with `--share` to expose on local network.');
+  }
   console.log('Press Ctrl+C to stop.\n');
 
   const shutdown = () => {

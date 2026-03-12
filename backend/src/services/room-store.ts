@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import type { ChatMessage, EditorCursor, EditorState, RoomEvent, RoomSummary, TimelineEntry } from '@codex-room/shared';
@@ -18,6 +19,16 @@ interface RoomState {
   updatedAt: string;
 }
 
+export class EditorConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly editor: EditorState
+  ) {
+    super(message);
+    this.name = 'EditorConflictError';
+  }
+}
+
 interface PersistedRoomState {
   roomId: string;
   workspace?: string;
@@ -29,6 +40,10 @@ interface PersistedRoomState {
 }
 
 const EDITOR_CURSOR_TTL_MS = 60_000;
+
+function workspaceStorageKey(workspace: string): string {
+  return createHash('sha256').update(workspace).digest('hex').slice(0, 24);
+}
 
 function toFiniteNonNegativeInteger(value: unknown): number | null {
   const n = typeof value === 'number' ? value : Number(value);
@@ -70,6 +85,8 @@ function normalizeCursorEntry(
 
 function normalizeEditor(editor: EditorState | null | undefined, roomId: string): EditorState {
   const text = typeof editor?.text === 'string' ? editor.text : '';
+  const versionRaw = typeof editor?.version === 'number' ? editor.version : Number((editor as any)?.version);
+  const version = Number.isFinite(versionRaw) && versionRaw >= 0 ? Math.floor(versionRaw) : 0;
   const updatedAt =
     typeof editor?.updatedAt === 'string' && editor.updatedAt
       ? editor.updatedAt
@@ -84,7 +101,7 @@ function normalizeEditor(editor: EditorState | null | undefined, roomId: string)
         .filter((cursor): cursor is EditorCursor => Boolean(cursor))
     : [];
 
-  return { roomId, text, updatedAt, updatedBy, ...(cursors.length ? { cursors } : {}) };
+  return { roomId, text, version, updatedAt, updatedBy, ...(cursors.length ? { cursors } : {}) };
 }
 
 export interface RoomThreadSummary {
@@ -599,7 +616,9 @@ export class RoomStore {
   constructor(private readonly logger: AppLogger, workspace = process.env.NLK_WORKDIR ?? process.cwd()) {
     this.workspace = resolve(workspace);
     const explicitStoragePath = process.env.NLK_ROOMS_STORAGE_PATH?.trim();
-    this.storagePath = explicitStoragePath || resolve(homedir(), '.codex-room/rooms.json');
+    this.storagePath =
+      explicitStoragePath ||
+      resolve(homedir(), '.codex-room', 'workspaces', workspaceStorageKey(this.workspace), 'rooms.json');
     this.legacyStoragePaths = explicitStoragePath
       ? []
       : [...new Set([
@@ -613,7 +632,12 @@ export class RoomStore {
 
   getRoom(roomId: string): RoomState {
     const existing = this.rooms.get(roomId);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.workspace && existing.workspace !== this.workspace) {
+        throw new Error('Room belongs to a different workspace');
+      }
+      return existing;
+    }
 
     const created: RoomState = {
       roomId,
@@ -623,6 +647,7 @@ export class RoomStore {
       editor: {
         roomId,
         text: '',
+        version: 0,
         updatedAt: new Date().toISOString(),
         updatedBy: 'system',
         cursors: []
@@ -657,6 +682,7 @@ export class RoomStore {
 
   listRooms(limit = 30): RoomSummary[] {
     return [...this.rooms.values()]
+      .filter((room) => room.workspace === this.workspace)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, limit)
       .map((room) => ({
@@ -845,9 +871,20 @@ export class RoomStore {
     roomId: string,
     userId: string,
     text: string,
-    options?: { userName?: string; selectionStart?: number; selectionEnd?: number }
+    options?: { userName?: string; selectionStart?: number; selectionEnd?: number; baseVersion?: number }
   ) {
     const room = this.getRoom(roomId);
+    const currentVersion =
+      typeof room.editor.version === 'number' && Number.isFinite(room.editor.version) ? room.editor.version : 0;
+    const baseVersion = toFiniteNonNegativeInteger(options?.baseVersion);
+    const isStaleWrite =
+      baseVersion !== null &&
+      baseVersion !== currentVersion &&
+      room.editor.updatedBy !== userId &&
+      room.editor.text !== text;
+    if (isStaleWrite) {
+      throw new EditorConflictError('Editor has been updated by another collaborator', room.editor);
+    }
     const updatedAt = new Date().toISOString();
     const parsedUpdatedAt = Date.parse(updatedAt);
     const maxAge = Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt - EDITOR_CURSOR_TTL_MS : Number.NEGATIVE_INFINITY;
@@ -867,6 +904,7 @@ export class RoomStore {
     const editor: EditorState = {
       roomId,
       text,
+      version: currentVersion + 1,
       updatedAt,
       updatedBy: userId,
       cursors: nextCursors
@@ -998,6 +1036,17 @@ export class RoomStore {
         at: event.at,
         meta: { kind: 'codex.failed' }
       });
+      return;
+    }
+
+    if (event.type === 'codex.turn.interrupted') {
+      this.addTimelineEntry(roomId, {
+        side: 'right',
+        label: 'codex',
+        text: 'Turn interrupted',
+        at: event.at,
+        meta: { kind: 'codex.interrupted' }
+      });
     }
   }
 
@@ -1053,9 +1102,13 @@ export class RoomStore {
       const parsed = JSON.parse(raw) as { rooms?: PersistedRoomState[] };
       const rooms = Array.isArray(parsed.rooms) ? parsed.rooms : [];
       for (const room of rooms) {
+        const roomWorkspace = typeof room.workspace === 'string' ? resolve(room.workspace) : '';
+        if (!roomWorkspace || roomWorkspace !== this.workspace) {
+          continue;
+        }
         this.rooms.set(room.roomId, {
           roomId: room.roomId,
-          workspace: typeof room.workspace === 'string' ? room.workspace : '',
+          workspace: roomWorkspace,
           messages: Array.isArray(room.messages) ? room.messages : [],
           timeline: Array.isArray(room.timeline) ? room.timeline : [],
           editor: normalizeEditor(room.editor, room.roomId),

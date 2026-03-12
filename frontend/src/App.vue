@@ -1268,6 +1268,47 @@ const contextAvailabilityText = computed(() => {
   return 'Context available: --%';
 });
 
+const contextAvailabilityTitle = computed(() => {
+  const lines = [contextAvailabilityText.value];
+  const usage = latestUsageFromEvent.value;
+  if (usage) {
+    lines.push(`Tokens: in ${usage.input}${usage.cachedInput ? ` (cached ${usage.cachedInput})` : ''} · out ${usage.output} · total ${usage.total}`);
+  }
+
+  const normalized = normalizeUsagePayload(latestThreadUsageRaw);
+  if (normalized) {
+    const contextWindow = pickNumber(normalized, [
+      'contextWindowTokens',
+      'context_window_tokens',
+      'contextWindow',
+      'context_window',
+      'modelContextWindow',
+      'model_context_window',
+      'maxInputTokens',
+      'max_input_tokens',
+      'maxTokens',
+      'max_tokens'
+    ]);
+    if (contextWindow !== null) {
+      lines.push(`Context window: ${contextWindow}`);
+    }
+
+    const remaining = pickNumber(normalized, [
+      'remainingTokens',
+      'remaining_tokens',
+      'availableTokens',
+      'available_tokens',
+      'contextRemainingTokens',
+      'context_remaining_tokens'
+    ]);
+    if (remaining !== null) {
+      lines.push(`Remaining tokens: ${remaining}`);
+    }
+  }
+
+  return lines.join('\n');
+});
+
 type TurnSegment =
   | { type: 'message'; id: string; entry: LogEntry }
   | { type: 'tech'; id: string; items: LogEntry[] };
@@ -1341,6 +1382,57 @@ function itemLabel(item: LogEntry): string {
     image_view: 'img'
   };
   return map[meta.itemType ?? ''] ?? (meta.itemType ?? 'item');
+}
+
+function techSegmentSummary(items: LogEntry[]): string {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const itemType = normalizeMeta(item).itemType ?? 'item';
+    counts.set(itemType, (counts.get(itemType) ?? 0) + 1);
+  }
+
+  const entries = [...counts.entries()];
+  const orderedKeys = [
+    'file_change',
+    'turn_diff',
+    'command_execution',
+    'reasoning',
+    'plan',
+    'permission_request',
+    'mcp_tool_call',
+    'collab_tool_call'
+  ];
+  entries.sort((a, b) => {
+    const aIdx = orderedKeys.indexOf(a[0]);
+    const bIdx = orderedKeys.indexOf(b[0]);
+    return (aIdx === -1 ? Number.MAX_SAFE_INTEGER : aIdx) - (bIdx === -1 ? Number.MAX_SAFE_INTEGER : bIdx);
+  });
+
+  const format = (count: number, singular: string, plural: string) => `${count} ${count === 1 ? singular : plural}`;
+  return entries
+    .map(([type, count]) => {
+      switch (type) {
+        case 'file_change':
+          return format(count, 'file edited', 'files edited');
+        case 'turn_diff':
+          return format(count, 'diff', 'diffs');
+        case 'command_execution':
+          return format(count, 'cmd', 'cmds');
+        case 'reasoning':
+          return format(count, 'thought', 'thoughts');
+        case 'plan':
+          return format(count, 'plan', 'plans');
+        case 'permission_request':
+          return format(count, 'approval', 'approvals');
+        case 'mcp_tool_call':
+        case 'collab_tool_call':
+          return format(count, 'tool call', 'tool calls');
+        default:
+          return format(count, type.replace(/_/g, ' '), `${type.replace(/_/g, ' ')}s`);
+      }
+    })
+    .slice(0, 3)
+    .join(' · ');
 }
 
 function itemBody(item: LogEntry): string {
@@ -2890,6 +2982,12 @@ onUnmounted(() => {
                     <span class="text-[11px] font-medium text-neutral-500">
                       {{ isExpanded(seg.id, seg.items) ? `hide ${seg.items.length} step${seg.items.length > 1 ? 's' : ''}` : `${seg.items.length} step${seg.items.length > 1 ? 's' : ''}` }}
                     </span>
+                    <span
+                      v-if="!isExpanded(seg.id, seg.items)"
+                      class="min-w-0 truncate text-[11px] text-neutral-400"
+                    >
+                      {{ techSegmentSummary(seg.items) }}
+                    </span>
                   </button>
 
                   <div v-if="isExpanded(seg.id, seg.items)" class="border-t border-neutral-200 bg-neutral-100">
@@ -2992,12 +3090,12 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
-          <div class="flex flex-col gap-3 border-t border-neutral-200 pt-3">
-            <div class="flex flex-wrap items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2 border-t border-neutral-200 pt-3">
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
               <div ref="modelMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[12rem] items-center justify-between gap-3 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  class="inline-flex min-w-[9rem] items-center justify-between gap-2 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
                   @click="toggleMenu('model')"
                 >
                   <span class="truncate">{{ selectedModelOptionLabel }}</span>
@@ -3022,7 +3120,7 @@ onUnmounted(() => {
               <div ref="effortMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[8rem] items-center justify-between gap-3 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  class="inline-flex min-w-[6.5rem] items-center justify-between gap-2 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
                   @click="toggleMenu('effort')"
                 >
                   <span class="truncate">{{ selectedEffortLabel }}</span>
@@ -3047,7 +3145,7 @@ onUnmounted(() => {
               <div ref="accessMenuEl" class="relative">
                 <button
                   type="button"
-                  class="inline-flex min-w-[10rem] items-center justify-between gap-3 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
+                  class="inline-flex min-w-[8.5rem] items-center justify-between gap-2 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-left text-xs text-neutral-800 transition-colors hover:bg-neutral-50"
                   @click="toggleMenu('access')"
                 >
                   <span class="truncate">{{ selectedAccessLabel }}</span>
@@ -3076,31 +3174,31 @@ onUnmounted(() => {
                 </div>
               </div>
             </div>
-            <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div class="ml-auto flex items-center gap-2">
               <span class="text-[11px] text-neutral-400">
+                <span :title="contextAvailabilityTitle">
                 {{ contextAvailabilityText }}
+                </span>
               </span>
-              <div class="flex items-center gap-2">
-                <button
+              <button
+                v-if="running"
+                :disabled="!canInterrupt"
+                @click="interruptCodex"
+                class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
+              >
+                Stop
+              </button>
+              <button
+                :disabled="!canSubmit"
+                @click="sendToCodex"
+                class="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-25"
+              >
+                <span
                   v-if="running"
-                  :disabled="!canInterrupt"
-                  @click="interruptCodex"
-                  class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
-                >
-                  Stop
-                </button>
-                <button
-                  :disabled="!canSubmit"
-                  @click="sendToCodex"
-                  class="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-25"
-                >
-                  <span
-                    v-if="running"
-                    class="size-[10px] animate-spin rounded-full border-[1.5px] border-white/30 border-t-white"
-                  ></span>
-                  {{ running ? 'Steer' : 'Run' }}
-                </button>
-              </div>
+                  class="size-[10px] animate-spin rounded-full border-[1.5px] border-white/30 border-t-white"
+                ></span>
+                {{ running ? 'Steer' : 'Run' }}
+              </button>
             </div>
           </div>
         </div>
@@ -3151,9 +3249,10 @@ onUnmounted(() => {
 :deep(.markdown-body pre) {
   overflow-x: auto;
   border-radius: 0.75rem;
-  background: #111827;
+  border: 1px solid #e5e7eb;
+  background: #f5f5f4;
   padding: 0.85rem 1rem;
-  color: #f3f4f6;
+  color: #1f2937;
 }
 
 :deep(.markdown-body pre code) {
