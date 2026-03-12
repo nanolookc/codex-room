@@ -7,14 +7,15 @@ import type {
   SendMessageInput,
   UpdateEditorInput
 } from '@codex-room/shared';
-import { RoomStore } from './services/room-store';
-import { CodexRunner } from './services/codex-runner';
+import { EditorConflictError, RoomStore } from './services/room-store';
+import { AppServerSession } from './services/codex-app-server-session';
 import { CodexRoomProxyManager } from './services/codex-room-proxy';
 import { AppLogger } from './services/logger';
 
-const HOST = process.env.HOST ?? '0.0.0.0';
+const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 3001);
 const WORKING_DIRECTORY = process.env.NLK_WORKDIR ?? process.cwd();
+const SESSION_KEY = process.env.NLK_SESSION_KEY?.trim() ?? '';
 const CODEX_MODEL = process.env.CODEX_MODEL ?? 'default';
 const CODEX_REASONING_EFFORT = process.env.CODEX_REASONING_EFFORT ?? 'medium';
 const SERVE_FRONTEND = true;
@@ -23,12 +24,6 @@ const FRONTEND_DIST =
 
 const logger = new AppLogger();
 const roomStore = new RoomStore(logger, WORKING_DIRECTORY);
-const codexRunner = new CodexRunner(
-  logger,
-  WORKING_DIRECTORY,
-  CODEX_MODEL,
-  CODEX_REASONING_EFFORT
-);
 const codexProxy = new CodexRoomProxyManager(
   logger,
   {
@@ -57,6 +52,92 @@ const MIME_BY_EXT: Record<string, string> = {
   txt: 'text/plain; charset=utf-8',
   wasm: 'application/wasm'
 };
+
+type CodexThreadSummary = {
+  id: string;
+  preview?: string;
+  updatedAt?: number;
+  createdAt?: number;
+  model?: string;
+  cwd?: string;
+};
+
+async function listCodexThreads(limit: number): Promise<CodexThreadSummary[]> {
+  const session = await AppServerSession.start(logger);
+  try {
+    const response = await session.request('thread/list', {
+      limit,
+      sortKey: 'updated_at',
+      sourceKinds: ['appServer', 'cli', 'vscode'],
+      ...(WORKING_DIRECTORY ? { cwd: WORKING_DIRECTORY } : {})
+    });
+    const data = Array.isArray(response?.data) ? response.data : [];
+    return data
+      .map((entry: any): CodexThreadSummary | null => {
+        const id = typeof entry?.id === 'string' ? entry.id : '';
+        if (!id) return null;
+        return {
+          id,
+          preview: typeof entry?.preview === 'string' ? entry.preview : undefined,
+          updatedAt:
+            typeof entry?.updatedAt === 'number'
+              ? entry.updatedAt
+              : typeof entry?.updated_at === 'number'
+                ? entry.updated_at
+                : undefined,
+          createdAt:
+            typeof entry?.createdAt === 'number'
+              ? entry.createdAt
+              : typeof entry?.created_at === 'number'
+                ? entry.created_at
+                : undefined,
+          model:
+            typeof entry?.model === 'string'
+              ? entry.model
+              : typeof entry?.modelProvider === 'string'
+                ? entry.modelProvider
+                : undefined,
+          cwd: typeof entry?.cwd === 'string' ? entry.cwd : undefined
+        };
+      })
+      .filter((entry): entry is CodexThreadSummary => Boolean(entry));
+  } finally {
+    session.close();
+  }
+}
+
+async function startCodexThread(): Promise<{ id: string }> {
+  const session = await AppServerSession.start(logger);
+  try {
+    const result = await session.request('thread/start', {
+      ...(CODEX_MODEL && CODEX_MODEL !== 'default' ? { model: CODEX_MODEL } : {}),
+      ...(WORKING_DIRECTORY ? { cwd: WORKING_DIRECTORY } : {})
+    });
+    const id = typeof result?.thread?.id === 'string' ? result.thread.id : null;
+    if (!id) throw new Error('Failed to create thread');
+    return { id };
+  } finally {
+    session.close();
+  }
+}
+
+function readRequestSessionKey(request: Request): string {
+  const fromHeader = request.headers.get('x-codex-room-key')?.trim();
+  if (fromHeader) return fromHeader;
+  try {
+    const url = new URL(request.url);
+    return url.searchParams.get('key')?.trim() ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function unauthorizedJson(message = 'Unauthorized'): Response {
+  return new Response(JSON.stringify({ ok: false, error: message }), {
+    status: 401,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' }
+  });
+}
 
 function contentTypeFor(pathname: string, fallback = 'application/octet-stream'): string {
   const ext = pathname.split('.').pop()?.toLowerCase();
@@ -92,6 +173,16 @@ const app = new Elysia()
       method: request.method,
       path
     });
+    if (!SESSION_KEY) return;
+    if (request.method === 'OPTIONS') return;
+    if (!path.startsWith('/api/')) return;
+    const provided = readRequestSessionKey(request);
+    if (provided && provided === SESSION_KEY) return;
+    logger.warn('http.request.unauthorized', {
+      method: request.method,
+      path
+    });
+    return unauthorizedJson('Missing or invalid session key');
   })
   .get('/health', () => ({ ok: true, at: new Date().toISOString() }))
   .get('/api/runtime', () => ({
@@ -99,6 +190,7 @@ const app = new Elysia()
     port: PORT,
     workingDirectory: WORKING_DIRECTORY,
     servingFrontend: SERVE_FRONTEND,
+    requiresSessionKey: Boolean(SESSION_KEY),
     codexModel: CODEX_MODEL,
     codexReasoningEffort: CODEX_REASONING_EFFORT
   }))
@@ -107,7 +199,7 @@ const app = new Elysia()
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 30;
     logger.info('codex.threads.requested', { limit: safeLimit, scope: 'app_server' });
     try {
-      const data = await codexRunner.listThreads(safeLimit);
+      const data = await listCodexThreads(safeLimit);
       return { data };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -120,7 +212,7 @@ const app = new Elysia()
     }
   })
   .post('/api/codex/threads/start', async () => {
-    const thread = await codexRunner.startThread();
+    const thread = await startCodexThread();
     logger.info('codex.thread.created', { threadId: thread.id });
     return { threadId: thread.id };
   })
@@ -130,7 +222,7 @@ const app = new Elysia()
     const threadId = input.threadId?.trim();
     if (!threadId) return { ok: false, error: 'threadId is required' };
     try {
-      await codexProxy.call(params.roomId, 'thread/read', { threadId, includeTurns: false });
+      await codexProxy.call(params.roomId, 'thread/resume', { threadId });
       roomStore.setThreadId(params.roomId, threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -146,15 +238,24 @@ const app = new Elysia()
         });
       }
       const isExpectedNewThread =
-        message.includes('thread not loaded') || message.includes('no rollout found');
+        message.includes('thread not loaded') ||
+        message.includes('no rollout found') ||
+        message.includes('not found');
       logger[isExpectedNewThread ? 'debug' : 'warn']('codex.thread.hydration.failed', {
         roomId: params.roomId,
         threadId,
         error: message
       });
-      if (isExpectedNewThread) {
-        roomStore.setThreadId(params.roomId, threadId);
-      }
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: isExpectedNewThread ? 'Thread was not found in this project' : message
+        }),
+        {
+          status: isExpectedNewThread ? 404 : 502,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' }
+        }
+      );
     }
     return { ok: true, roomId: params.roomId, threadId, imported: 0 };
   })
@@ -181,11 +282,25 @@ const app = new Elysia()
       selectionStart: input.selectionStart ?? null,
       selectionEnd: input.selectionEnd ?? null
     });
-    return roomStore.updateEditor(params.roomId, input.userId, input.text, {
-      userName: input.userName,
-      selectionStart: input.selectionStart,
-      selectionEnd: input.selectionEnd
-    });
+    try {
+      return roomStore.updateEditor(params.roomId, input.userId, input.text, {
+        userName: input.userName,
+        baseVersion: input.baseVersion,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd
+      });
+    } catch (error) {
+      if (error instanceof EditorConflictError) {
+        return new Response(
+          JSON.stringify({ ok: false, error: error.message, code: 'EDITOR_CONFLICT', editor: error.editor }),
+          {
+            status: 409,
+            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+          }
+        );
+      }
+      throw error;
+    }
   })
   .post('/api/rooms/:roomId/codex/rpc', async ({ params, body, set }) => {
     const input = body as CodexRpcCallInput;
@@ -220,6 +335,13 @@ const app = new Elysia()
       return { ok: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('Unknown or already resolved server request')) {
+        logger.debug('codex.rpc.respond.duplicate_ignored', {
+          roomId: params.roomId,
+          requestId: input?.requestId
+        });
+        return { ok: true, alreadyResolved: true };
+      }
       set.status = 400;
       logger.warn('codex.rpc.respond.failed', {
         roomId: params.roomId,
@@ -235,8 +357,20 @@ const app = new Elysia()
     set.headers.Connection = 'keep-alive';
 
     const queue: string[] = [];
+    const maxQueueSize = 500;
     let resolveNext: (() => void) | null = null;
     const push = (payload: unknown) => {
+      if (queue.length >= maxQueueSize) {
+        const dropped = queue.length - maxQueueSize + 1;
+        queue.splice(0, dropped);
+        queue.push(
+          JSON.stringify({
+            type: 'system.queueOverflow',
+            dropped,
+            at: new Date().toISOString()
+          })
+        );
+      }
       queue.push(JSON.stringify(payload));
       if (resolveNext) {
         resolveNext();
@@ -249,6 +383,10 @@ const app = new Elysia()
     });
 
     push({ type: 'system.connected', at: new Date().toISOString() });
+    const heartbeat = setInterval(() => {
+      push({ type: 'system.heartbeat', at: new Date().toISOString() });
+    }, 15_000);
+    heartbeat.unref?.();
     try {
       while (!request.signal.aborted) {
         if (queue.length === 0) {
@@ -264,6 +402,7 @@ const app = new Elysia()
         }
       }
     } finally {
+      clearInterval(heartbeat);
       logger.info('room.events.disconnected', { roomId: params.roomId });
       unsubscribe();
     }

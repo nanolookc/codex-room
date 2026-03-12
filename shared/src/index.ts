@@ -12,6 +12,7 @@ export interface ChatMessage {
 export interface EditorState {
   roomId: string;
   text: string;
+  version: number;
   updatedAt: string;
   updatedBy: string;
   cursors?: EditorCursor[];
@@ -47,6 +48,7 @@ export interface TimelineEntry {
       | 'codex.started'
       | 'codex.item'
       | 'codex.completed'
+      | 'codex.interrupted'
       | 'codex.failed';
     itemType?: string;
     model?: string;
@@ -77,6 +79,7 @@ export type RoomEvent =
   | { type: 'editor.updated'; editor: EditorState }
   | { type: 'presence.joined'; userId: string; userName: string; at: string }
   | { type: 'presence.left'; userId: string; at: string }
+  | { type: 'system.queueOverflow'; dropped: number; at: string }
   | { type: 'codex.rpc.notification'; message: CodexRpcMessage; at: string }
   | { type: 'codex.rpc.serverRequest'; message: CodexRpcMessage; at: string }
   | {
@@ -107,6 +110,7 @@ export interface UpdateEditorInput {
   userId: string;
   userName?: string;
   text: string;
+  baseVersion?: number;
   selectionStart?: number;
   selectionEnd?: number;
 }

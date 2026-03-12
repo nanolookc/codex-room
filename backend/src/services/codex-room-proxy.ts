@@ -57,9 +57,47 @@ function isJsonRpcError(value: unknown): value is { code: number; message: strin
   );
 }
 
+const ALLOWED_METHODS = new Set([
+  'app/list',
+  'command/exec',
+  'experimentalFeature/list',
+  'model/list',
+  'review/start',
+  'skills/list',
+  'thread/archive',
+  'thread/compact/start',
+  'thread/fork',
+  'thread/list',
+  'thread/loaded/list',
+  'thread/read',
+  'thread/resume',
+  'thread/rollback',
+  'thread/start',
+  'thread/unarchive',
+  'turn/interrupt',
+  'turn/start',
+  'turn/steer'
+]);
+
+const THREAD_SCOPED_METHODS = new Set([
+  'review/start',
+  'thread/archive',
+  'thread/compact/start',
+  'thread/fork',
+  'thread/read',
+  'thread/resume',
+  'thread/rollback',
+  'thread/unarchive',
+  'turn/interrupt',
+  'turn/start',
+  'turn/steer'
+]);
+
 export class CodexRoomProxyManager {
   private readonly rooms = new Map<string, RoomSession>();
   private readonly workspaceRoot: string | null;
+  private readonly idleTtlMs = 15 * 60 * 1000;
+  private readonly sweepInterval: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly logger: AppLogger,
@@ -69,6 +107,8 @@ export class CodexRoomProxyManager {
     private readonly reasoningEffort?: string
   ) {
     this.workspaceRoot = normalizePathForScope(workingDirectory);
+    this.sweepInterval = setInterval(() => this.sweepIdleRooms(), 60_000);
+    this.sweepInterval.unref?.();
   }
 
   async call(roomId: string, method: string, params?: unknown): Promise<unknown> {
@@ -82,7 +122,8 @@ export class CodexRoomProxyManager {
     const room = await this.ensureRoom(roomId);
     room.lastActiveAt = Date.now();
     const nextParams = await this.applyPolicy(roomId, room.session, method, params);
-    const result = await room.session.request(method, nextParams);
+    const rawResult = await room.session.request(method, nextParams);
+    const result = await this.applyResultPolicy(room.session, method, rawResult);
 
     const threadId =
       (typeof (result as any)?.thread?.id === 'string' && (result as any).thread.id) ||
@@ -154,6 +195,18 @@ export class CodexRoomProxyManager {
     session.onRequest(async (message) => {
       const id = message.id;
       if (id === undefined) return undefined;
+      const method = typeof message.method === 'string' ? message.method : '';
+      room.lastActiveAt = Date.now();
+
+      if (method === 'account/chatgptAuthTokens/refresh') {
+        return {
+          handled: true,
+          error: {
+            code: -32601,
+            message: 'Externally-managed ChatGPT token refresh is not supported'
+          }
+        } as const;
+      }
 
       const key = String(id);
       const responsePromise = new Promise<{ result?: unknown; error?: { code: number; message: string; data?: unknown } }>((resolve) => {
@@ -190,45 +243,59 @@ export class CodexRoomProxyManager {
     return room;
   }
 
+  private sweepIdleRooms() {
+    const now = Date.now();
+    for (const [roomId, room] of this.rooms) {
+      if (room.pendingServerRequests.size > 0) continue;
+      if (now - room.lastActiveAt < this.idleTtlMs) continue;
+      this.logger.info('codex.room_proxy.idle_close', { roomId, idleMs: now - room.lastActiveAt });
+      this.closeRoom(roomId, room);
+    }
+  }
+
+  private closeRoom(roomId: string, room: RoomSession) {
+    this.rooms.delete(roomId);
+    for (const pending of room.pendingServerRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({
+        error: { code: -32000, message: 'Codex room session closed due to inactivity' }
+      });
+    }
+    room.pendingServerRequests.clear();
+    room.session.close();
+  }
+
   private async applyPolicy(
-    roomId: string,
+    _roomId: string,
     session: AppServerSession,
     method: string,
     params: unknown
   ): Promise<unknown> {
+    if (!ALLOWED_METHODS.has(method)) {
+      throw new Error(`Method is not available in codex-room proxy: ${method}`);
+    }
+
     const obj =
       params && typeof params === 'object' && !Array.isArray(params)
         ? ({ ...(params as Record<string, unknown>) } as Record<string, unknown>)
         : {};
-
-    const methodWithThreadId = [
-      'thread/read',
-      'thread/resume',
-      'thread/fork',
-      'thread/archive',
-      'thread/unarchive',
-      'thread/compact/start',
-      'thread/rollback',
-      'turn/start',
-      'turn/steer',
-      'turn/interrupt',
-      'review/start',
-      'app/list'
-    ];
 
     const threadId =
       (typeof obj.threadId === 'string' && obj.threadId) ||
       (typeof obj.reviewThreadId === 'string' && obj.reviewThreadId) ||
       null;
 
-    if (threadId && methodWithThreadId.includes(method)) {
+    if (threadId && THREAD_SCOPED_METHODS.has(method)) {
       await this.assertThreadScope(session, threadId);
     }
 
     if (method === 'thread/list') {
-      obj.sortKey = obj.sortKey ?? 'updated_at';
-      obj.sourceKinds = ['appServer', 'cli', 'vscode'];
       if (this.workingDirectory) obj.cwd = this.workingDirectory;
+      return obj;
+    }
+
+    if (method === 'skills/list') {
+      if (this.workingDirectory) obj.cwds = [this.workingDirectory];
       return obj;
     }
 
@@ -253,11 +320,36 @@ export class CodexRoomProxyManager {
       return obj;
     }
 
-    if (method.startsWith('config/') || method.startsWith('account/')) {
-      throw new Error(`Method is not available in codex-room proxy: ${method}`);
+    return Object.keys(obj).length > 0 ? obj : params;
+  }
+
+  private async applyResultPolicy(
+    session: AppServerSession,
+    method: string,
+    result: unknown
+  ): Promise<unknown> {
+    if (method !== 'thread/loaded/list' || !this.workspaceRoot) {
+      return result;
     }
 
-    return Object.keys(obj).length > 0 ? obj : params;
+    const data = Array.isArray((result as any)?.data) ? (result as any).data : null;
+    if (!data) return result;
+
+    const filtered: string[] = [];
+    for (const threadId of data) {
+      if (typeof threadId !== 'string' || !threadId) continue;
+      try {
+        await this.assertThreadScope(session, threadId);
+        filtered.push(threadId);
+      } catch {
+        // Hide threads outside the room workspace.
+      }
+    }
+
+    return {
+      ...(result && typeof result === 'object' ? (result as Record<string, unknown>) : {}),
+      data: filtered
+    };
   }
 
   private async assertThreadScope(session: AppServerSession, threadId: string): Promise<void> {

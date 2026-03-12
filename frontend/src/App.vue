@@ -10,8 +10,8 @@ import DiffPatch from './components/DiffPatch.vue';
 
 const query = new URLSearchParams(window.location.search);
 const API = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
-const CONTEXT_WINDOW_TOKENS = Number((import.meta.env.VITE_CONTEXT_WINDOW_TOKENS as string | undefined) ?? '200000');
 const roomFromQuery = query.get('room');
+const sessionKeyFromQuery = query.get('key')?.trim() ?? '';
 const initialRoomId = roomFromQuery ?? 'main';
 const roomId = ref(initialRoomId);
 const view = ref<'home' | 'chat'>(roomFromQuery ? 'chat' : 'home');
@@ -104,9 +104,11 @@ type ParsedCommandExecution = {
 const logEntries = ref<LogEntry[]>([]);
 const editorText = ref('');
 const editorCursors = ref<EditorCursor[]>([]);
+const editorVersion = ref(0);
 const cursorOverlays = ref<CursorOverlay[]>([]);
 const running = ref(false);
 const timelineEl = ref<HTMLElement | null>(null);
+const shouldAutoScrollTimeline = ref(true);
 const activeTaskStartedAt = ref<number | null>(null);
 const workingSeconds = ref(0);
 type UsageDisplay = {
@@ -116,10 +118,23 @@ type UsageDisplay = {
   cachedInput?: number;
   contextAvailablePercent?: number;
 };
+type ModelOption = {
+  id: string;
+  label: string;
+  isDefault?: boolean;
+};
+type AccessMode = 'full-access' | 'need-approve';
 const usageByTurnAt = ref(new Map<string, UsageDisplay>());
 const latestUsageFromEvent = ref<UsageDisplay | null>(null);
 const currentThreadId = ref<string | null>(null);
 const debugCopyStatus = ref<'idle' | 'copied' | 'error'>('idle');
+const apiError = ref<string | null>(null);
+const modelOptions = ref<ModelOption[]>([]);
+const selectedModel = ref('default');
+const accessMode = ref<AccessMode>('full-access');
+const openMenu = ref<'model' | 'access' | null>(null);
+const modelMenuEl = ref<HTMLElement | null>(null);
+const accessMenuEl = ref<HTMLElement | null>(null);
 
 let eventsAbortController: AbortController | null = null;
 let editorTimer: number | null = null;
@@ -128,8 +143,6 @@ let applyingRemoteEditorUpdate = false;
 let eventsConnectionSeq = 0;
 let activeCodexTurnId: string | null = null;
 let latestThreadUsageRaw: unknown = null;
-let lastCodexNotificationSignature: string | null = null;
-let lastCodexNotificationAtMs = 0;
 const liveCodexItemState = new Map<string, Record<string, unknown>>();
 const latestTurnDiffPatchByTurnId = new Map<string, string>();
 const recentDebugEvents: DebugEventSnapshot[] = [];
@@ -140,6 +153,20 @@ const canRun = computed(() => hasPrompt.value && !running.value);
 const canSteer = computed(() => hasPrompt.value && running.value);
 const canSubmit = computed(() => canRun.value || canSteer.value);
 const canInterrupt = computed(() => running.value);
+const defaultModelOption = computed(() =>
+  modelOptions.value.find((option) => option.isDefault && option.id !== 'default') ?? null
+);
+const selectedModelOptionLabel = computed(() => {
+  if (selectedModel.value === 'default') {
+    if (defaultModelOption.value?.label) return defaultModelOption.value.label;
+    const fallbackLabel = modelOptions.value.find((option) => option.id === 'default')?.label ?? 'Project Default';
+    return fallbackLabel.replace(/^Default\s*[·-]\s*/u, '').trim() || 'Project Default';
+  }
+  return modelOptions.value.find((option) => option.id === selectedModel.value)?.label ?? selectedModel.value;
+});
+const selectedAccessLabel = computed(() =>
+  accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
+);
 
 function randomPick<T>(items: T[]): T {
   return items[Math.floor(Math.random() * items.length)];
@@ -161,8 +188,6 @@ function shortId(value: string | null | undefined, head = 4, tail = 5): string {
 function resetCodexRuntimeState() {
   activeCodexTurnId = null;
   latestThreadUsageRaw = null;
-  lastCodexNotificationSignature = null;
-  lastCodexNotificationAtMs = 0;
   liveCodexItemState.clear();
   latestTurnDiffPatchByTurnId.clear();
   recentDebugEvents.length = 0;
@@ -356,15 +381,38 @@ function uniqueTextParts(parts: string[]): string[] {
 
 function extractCodexUsagePayload(value: any): unknown {
   if (!value || typeof value !== 'object') return undefined;
-  return (
+  const nested =
     value.usage ??
     value.tokenUsage ??
     value.token_usage ??
     value.turn?.usage ??
     value.turn?.tokenUsage ??
     value.turn?.token_usage ??
-    undefined
-  );
+    undefined;
+  if (!nested || typeof nested !== 'object') return nested;
+  if (
+    typeof value.modelContextWindow === 'number' ||
+    typeof value.model_context_window === 'number' ||
+    typeof value.contextWindowTokens === 'number' ||
+    typeof value.context_window_tokens === 'number'
+  ) {
+    return {
+      ...(nested as Record<string, unknown>),
+      ...(typeof value.modelContextWindow === 'number'
+        ? { modelContextWindow: value.modelContextWindow }
+        : {}),
+      ...(typeof value.model_context_window === 'number'
+        ? { model_context_window: value.model_context_window }
+        : {}),
+      ...(typeof value.contextWindowTokens === 'number'
+        ? { contextWindowTokens: value.contextWindowTokens }
+        : {}),
+      ...(typeof value.context_window_tokens === 'number'
+        ? { context_window_tokens: value.context_window_tokens }
+        : {})
+    };
+  }
+  return nested;
 }
 
 function safeJson(value: unknown): string {
@@ -373,6 +421,23 @@ function safeJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function apiHeaders(init?: HeadersInit): Headers {
+  const headers = new Headers(init);
+  if (sessionKeyFromQuery) headers.set('x-codex-room-key', sessionKeyFromQuery);
+  return headers;
+}
+
+async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(`${API}${path}`, {
+    ...init,
+    headers: apiHeaders(init.headers)
+  });
+  if (response.status === 401) {
+    apiError.value = 'Session key is missing or invalid. Re-open the room link from `codex-room start`.';
+  }
+  return response;
 }
 
 function compactDiffText(value: unknown): string {
@@ -480,14 +545,8 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
         return [kind, p].filter(Boolean).join(': ');
       })
       .filter(Boolean);
-    const rawPatch = extractItemRawPatch(item, itemType);
-    const diff =
-      rawPatch && hasPatchFileHeaders(rawPatch)
-        ? compactDiffText(rawPatch)
-        : '';
     const parts = [
       fileLines.length ? `files:\n${fileLines.map((l) => `- ${l}`).join('\n')}` : '',
-      diff ? `diff:\n${diff}` : '',
       typeof item.outputDelta === 'string' && item.outputDelta.trim() ? item.outputDelta.trim() : ''
     ].filter(Boolean);
     return parts.join('\n').trim() || safeJson(item);
@@ -518,13 +577,7 @@ function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string,
   const itemType = codexItemTypeForUi(item);
   if (itemType === 'user_message') return;
   const details = codexItemDetailsText(item, itemType).trim();
-  let rawPatch = extractItemRawPatch(item, itemType) ?? undefined;
-  if (itemType === 'file_change' && options.turnId) {
-    const fullTurnDiff = latestTurnDiffPatchByTurnId.get(options.turnId);
-    if (fullTurnDiff && hasPatchFileHeaders(fullTurnDiff)) {
-      rawPatch = fullTurnDiff;
-    }
-  }
+  const rawPatch = extractItemRawPatch(item, itemType) ?? undefined;
   const meta = {
     kind: 'codex.item',
     itemType,
@@ -541,21 +594,35 @@ function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string,
   });
 }
 
-function patchFileChangeEntryForTurn(turnId: string | null, patch: string, at: string): boolean {
+function upsertTurnDiffEntryForTurn(turnId: string | null, patch: string, at: string): boolean {
   if (!turnId || !patch.trim()) return false;
   for (let i = logEntries.value.length - 1; i >= 0; i--) {
     const entry = logEntries.value[i];
     const meta = normalizeMeta(entry) as any;
-    if (meta.kind !== 'codex.item' || meta.itemType !== 'file_change') continue;
+    if (meta.kind !== 'codex.item' || meta.itemType !== 'turn_diff') continue;
     if ((meta.turnId ?? null) !== turnId) continue;
     const prevPatch = typeof entry.rawPatch === 'string' ? entry.rawPatch : '';
     if (prevPatch === patch) return true;
     const next = [...logEntries.value];
-    next[i] = { ...entry, rawPatch: patch, at };
+    next[i] = {
+      ...entry,
+      text: 'Item: turn_diff',
+      rawPatch: patch,
+      at
+    };
     logEntries.value = next;
     return true;
   }
-  return false;
+  appendCodexItemTimeline(
+    {
+      type: 'turn_diff',
+      diff: patch,
+      source: 'turn.diff.updated'
+    },
+    at,
+    { turnId }
+  );
+  return true;
 }
 
 function appendCodexTurnStarted(prompt: string, at: string, model?: string, reasoningEffort?: string) {
@@ -571,7 +638,7 @@ function appendCodexTurnStarted(prompt: string, at: string, model?: string, reas
 }
 
 function appendCodexTurnTerminal(
-  kind: 'completed' | 'failed',
+  kind: 'completed' | 'failed' | 'interrupted',
   at: string,
   options: { finalResponse?: string; usage?: unknown; error?: string } = {}
 ) {
@@ -582,6 +649,18 @@ function appendCodexTurnTerminal(
       text: `Error: ${options.error ?? 'Turn failed'}`,
       at,
       meta: { kind: 'codex.failed' }
+    });
+    stopWorkingTimer(at);
+    return;
+  }
+
+  if (kind === 'interrupted') {
+    pushEntry({
+      side: 'right',
+      label: 'codex',
+      text: 'Turn interrupted',
+      at,
+      meta: { kind: 'codex.interrupted' }
     });
     stopWorkingTimer(at);
     return;
@@ -708,6 +787,7 @@ function normalizeMeta(entry: Pick<LogEntry, 'meta' | 'text' | 'side'>): NonNull
   if (entry.side === 'left') return { kind: 'user.message' };
   if (entry.text.startsWith('Started:')) return { kind: 'codex.started' };
   if (entry.text.startsWith('Turn completed')) return { kind: 'codex.completed' };
+  if (entry.text.startsWith('Turn interrupted')) return { kind: 'codex.interrupted' };
   if (entry.text.startsWith('Error:')) return { kind: 'codex.failed' };
   if (entry.text.startsWith('Item:')) {
     const firstLine = entry.text.split('\n')[0] ?? '';
@@ -743,6 +823,7 @@ function badgeText(entry: LogEntry): string {
   if (meta.kind === 'user.message') return 'user';
   if (meta.kind === 'codex.started') return 'started';
   if (meta.kind === 'codex.completed') return 'done';
+  if (meta.kind === 'codex.interrupted') return 'stopped';
   if (meta.kind === 'codex.failed') return 'error';
   return meta.itemType ?? 'item';
 }
@@ -752,6 +833,7 @@ function badgeClass(entry: LogEntry): string {
   if (meta.kind === 'user.message') return 'bg-neutral-100 text-neutral-500';
   if (meta.kind === 'codex.started') return 'bg-blue-50 text-blue-600';
   if (meta.kind === 'codex.completed') return 'bg-emerald-50 text-emerald-600';
+  if (meta.kind === 'codex.interrupted') return 'bg-amber-50 text-amber-700';
   if (meta.kind === 'codex.failed') return 'bg-red-50 text-red-600';
   if (meta.itemType === 'reasoning') return 'bg-amber-50 text-amber-600';
   if (meta.itemType === 'command_execution') return 'bg-indigo-50 text-indigo-600';
@@ -778,6 +860,7 @@ function bodyText(entry: LogEntry): string {
   if (meta.kind === 'codex.completed' && entry.text.startsWith('Turn completed')) {
     return entry.text.replace(/^Turn completed\n?/, '').trim() || 'Turn completed';
   }
+  if (meta.kind === 'codex.interrupted') return 'Turn interrupted';
   return entry.text;
 }
 
@@ -828,7 +911,7 @@ const turnDurationByEntryId = computed(() => {
       continue;
     }
 
-    if (kind === 'codex.completed' || kind === 'codex.failed') {
+    if (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted') {
       const ended = new Date(entry.at).getTime();
       const endedMs = Number.isNaN(ended) ? Date.now() : ended;
       const totalSeconds = Math.floor((endedMs - startedAtMs) / 1000);
@@ -889,7 +972,7 @@ const groups = computed<DisplayGroup[]>(() => {
       current = { type: 'turn', id: entry.id, startEntry: entry, items: [] };
       continue;
     }
-    if (kind === 'codex.completed' || kind === 'codex.failed') {
+    if (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted') {
       if (current) { current.endEntry = entry; result.push(current); current = null; }
       continue;
     }
@@ -913,7 +996,10 @@ function turnIsRunning(group: TurnGroup): boolean {
 function turnStatusClass(group: TurnGroup): string {
   if (turnIsRunning(group)) return 'bg-amber-400 animate-pulse';
   if (!group.endEntry) return 'bg-neutral-300';
-  return getEntryKind(group.endEntry) === 'codex.completed' ? 'bg-emerald-400' : 'bg-red-400';
+  const kind = getEntryKind(group.endEntry);
+  if (kind === 'codex.completed') return 'bg-emerald-400';
+  if (kind === 'codex.interrupted') return 'bg-amber-400';
+  return 'bg-red-400';
 }
 
 function turnMeta(group: TurnGroup): string {
@@ -957,28 +1043,6 @@ function turnMetaTitle(group: TurnGroup): string {
   return details.join('\n');
 }
 
-function parseContextAvailablePercent(text: string): number | null {
-  const match = text.match(/^Context:\s*(\d{1,3})%\s*available$/m);
-  if (!match) return null;
-  const percent = Number(match[1]);
-  if (!Number.isFinite(percent)) return null;
-  return Math.min(100, Math.max(0, Math.round(percent)));
-}
-
-function parseTotalTokens(text: string): number | null {
-  const match = text.match(/^Tokens:\s*.*\btotal\s+(\d+)\b/m);
-  if (!match) return null;
-  const total = Number(match[1]);
-  if (!Number.isFinite(total) || total < 0) return null;
-  return total;
-}
-
-function estimateContextAvailablePercent(totalTokens: number): number | null {
-  if (!Number.isFinite(CONTEXT_WINDOW_TOKENS) || CONTEXT_WINDOW_TOKENS <= 0) return null;
-  const available = ((CONTEXT_WINDOW_TOKENS - totalTokens) / CONTEXT_WINDOW_TOKENS) * 100;
-  return Math.min(100, Math.max(0, Math.round(available)));
-}
-
 function toFiniteNumber(value: unknown): number | null {
   const n = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(n) ? n : null;
@@ -1007,6 +1071,61 @@ function normalizeUsagePayload(usage: unknown): Record<string, unknown> | null {
   return { ...nested, ...(totalObj ?? lastObj ?? {}) };
 }
 
+function extractContextAvailabilityPercent(usage: unknown): number | null {
+  const obj = normalizeUsagePayload(usage);
+  if (!obj) return null;
+
+  const directPercent = pickNumber(obj, [
+    'contextAvailablePercent',
+    'context_available_percent',
+    'remainingPercent',
+    'remaining_percent'
+  ]);
+  if (directPercent !== null) {
+    return Math.min(100, Math.max(0, Math.round(directPercent)));
+  }
+
+  const contextWindow = pickNumber(obj, [
+    'contextWindowTokens',
+    'context_window_tokens',
+    'contextWindow',
+    'context_window',
+    'modelContextWindow',
+    'model_context_window',
+    'maxInputTokens',
+    'max_input_tokens',
+    'maxTokens',
+    'max_tokens'
+  ]);
+  if (!contextWindow || contextWindow <= 0) return null;
+
+  const remaining = pickNumber(obj, [
+    'remainingTokens',
+    'remaining_tokens',
+    'availableTokens',
+    'available_tokens',
+    'contextRemainingTokens',
+    'context_remaining_tokens'
+  ]);
+  if (remaining !== null) {
+    return Math.min(100, Math.max(0, Math.round((remaining / contextWindow) * 100)));
+  }
+
+  const used = pickNumber(obj, [
+    'totalTokens',
+    'total_tokens',
+    'inputTokens',
+    'input_tokens',
+    'promptTokens',
+    'prompt_tokens'
+  ]);
+  if (used !== null) {
+    return Math.min(100, Math.max(0, Math.round(((contextWindow - used) / contextWindow) * 100)));
+  }
+
+  return null;
+}
+
 function usageFromEvent(usage: unknown): UsageDisplay | null {
   const obj = normalizeUsagePayload(usage);
   if (!obj) return null;
@@ -1023,39 +1142,8 @@ function usageFromEvent(usage: unknown): UsageDisplay | null {
       ? pickNumber(obj.input_tokens_details as Record<string, unknown>, ['cachedTokens', 'cached_tokens'])
       : null) ??
     null;
-
-  const directPercent = pickNumber(obj, [
-    'contextAvailablePercent',
-    'context_available_percent',
-    'remainingPercent',
-    'remaining_percent'
-  ]);
-  const contextWindow = pickNumber(obj, [
-    'modelContextWindow',
-    'model_context_window',
-    'contextWindowTokens',
-    'context_window_tokens',
-    'contextWindow',
-    'context_window',
-    'maxInputTokens',
-    'max_input_tokens',
-    'maxTokens',
-    'max_tokens'
-  ]);
-  const remaining = pickNumber(obj, [
-    'remainingTokens',
-    'remaining_tokens',
-    'availableTokens',
-    'available_tokens',
-    'contextRemainingTokens',
-    'context_remaining_tokens'
-  ]);
-  const derivedPercent =
-    directPercent ??
-    (contextWindow && remaining !== null ? (remaining / contextWindow) * 100 : null) ??
-    (contextWindow ? ((contextWindow - total) / contextWindow) * 100 : null);
-  const contextAvailablePercent =
-    derivedPercent === null ? undefined : Math.min(100, Math.max(0, Math.round(derivedPercent)));
+  const contextAvailablePercentRaw = extractContextAvailabilityPercent(usage);
+  const contextAvailablePercent = contextAvailablePercentRaw === null ? undefined : contextAvailablePercentRaw;
 
   if (!input && !output && !total && contextAvailablePercent === undefined) return null;
   return {
@@ -1068,11 +1156,13 @@ function usageFromEvent(usage: unknown): UsageDisplay | null {
 }
 
 const latestContextAvailablePercent = computed(() => {
+  const fromLiveUsage = usageFromEvent(latestThreadUsageRaw)?.contextAvailablePercent;
+  if (fromLiveUsage !== undefined) return fromLiveUsage;
   for (let i = groups.value.length - 1; i >= 0; i -= 1) {
     const group = groups.value[i];
     if (group.type !== 'turn' || !group.endEntry) continue;
-    const percent = parseContextAvailablePercent(group.endEntry.text);
-    if (percent !== null) return percent;
+    const fromReplayUsage = usageByTurnAt.value.get(group.endEntry.at)?.contextAvailablePercent;
+    if (typeof fromReplayUsage === 'number') return fromReplayUsage;
   }
   return null;
 });
@@ -1081,16 +1171,11 @@ const contextAvailabilityText = computed(() => {
   if (latestUsageFromEvent.value?.contextAvailablePercent !== undefined) {
     return `Context available: ${latestUsageFromEvent.value.contextAvailablePercent}%`;
   }
+  if (running.value) {
+    return 'Context available: --%';
+  }
   if (latestContextAvailablePercent.value !== null) {
     return `Context available: ${latestContextAvailablePercent.value}%`;
-  }
-  for (let i = groups.value.length - 1; i >= 0; i -= 1) {
-    const group = groups.value[i];
-    if (group.type !== 'turn' || !group.endEntry) continue;
-    const total = parseTotalTokens(group.endEntry.text);
-    if (total === null) continue;
-    const estimated = estimateContextAvailablePercent(total);
-    if (estimated !== null) return `Context available: ~${estimated}%`;
   }
   return 'Context available: --%';
 });
@@ -1140,7 +1225,7 @@ function shouldCollapseTechSegment(items: LogEntry[]): boolean {
 }
 
 function shouldAutoExpand(items: LogEntry[]): boolean {
-  return items.some(hasDiffItem);
+  return false;
 }
 
 function isExpanded(id: string, items: LogEntry[]): boolean {
@@ -1233,6 +1318,15 @@ function itemRowAlignClass(item: LogEntry): string {
 }
 
 function itemPatch(item: LogEntry): string | null {
+  const meta = normalizeMeta(item) as any;
+  if (meta.itemType === 'file_change' && typeof meta.turnId === 'string') {
+    const hasTurnLevelDiff = logEntries.value.some((entry) => {
+      const entryMeta = normalizeMeta(entry) as any;
+      return entryMeta.kind === 'codex.item' && entryMeta.itemType === 'turn_diff' && entryMeta.turnId === meta.turnId;
+    });
+    if (hasTurnLevelDiff) return null;
+  }
+
   if (typeof item.rawPatch === 'string' && item.rawPatch.trim()) {
     const candidate = item.rawPatch;
     return hasPatchFileHeaders(candidate) ? candidate : null;
@@ -1252,6 +1346,44 @@ function itemPatch(item: LogEntry): string | null {
   const hunkIndex = text.indexOf('@@ ');
   if (hunkIndex >= 0) return null;
   return null;
+}
+
+function approvalPolicyForMode(mode: AccessMode): string {
+  return mode === 'full-access' ? 'never' : 'unlessTrusted';
+}
+
+function toggleMenu(menu: 'model' | 'access') {
+  openMenu.value = openMenu.value === menu ? null : menu;
+}
+
+function closeMenus() {
+  openMenu.value = null;
+}
+
+function selectModelOption(optionId: string) {
+  selectedModel.value = optionId;
+  closeMenus();
+}
+
+function selectAccessMode(mode: AccessMode) {
+  accessMode.value = mode;
+  closeMenus();
+}
+
+function sandboxModeForMode(mode: AccessMode): string {
+  return mode === 'full-access' ? 'dangerFullAccess' : 'workspaceWrite';
+}
+
+function sandboxPolicyForMode(mode: AccessMode): Record<string, unknown> {
+  if (mode === 'full-access') {
+    return { type: 'dangerFullAccess' };
+  }
+
+  return {
+    type: 'workspaceWrite',
+    ...(workingDirectory.value ? { writableRoots: [workingDirectory.value] } : {}),
+    networkAccess: true
+  };
 }
 
 function startWorkingTimer(startedAtIso?: string) {
@@ -1292,13 +1424,14 @@ function timelineEntryKind(entry: TimelineEntry): TimelineEntry['meta']['kind'] 
   if (entry.side === 'left') return 'user.message';
   if (entry.text.startsWith('Started:')) return 'codex.started';
   if (entry.text.startsWith('Turn completed')) return 'codex.completed';
+  if (entry.text.startsWith('Turn interrupted')) return 'codex.interrupted';
   if (entry.text.startsWith('Error:')) return 'codex.failed';
   if (entry.text.startsWith('Item:')) return 'codex.item';
   return null;
 }
 
 async function codexRpc(method: string, params?: unknown): Promise<any> {
-  const response = await fetch(`${API}/api/rooms/${roomId.value}/codex/rpc`, {
+  const response = await apiFetch(`/api/rooms/${roomId.value}/codex/rpc`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ method, params })
@@ -1311,11 +1444,180 @@ async function codexRpc(method: string, params?: unknown): Promise<any> {
 }
 
 async function codexRespond(requestId: number | string, payload: { result?: unknown; error?: { code: number; message: string; data?: unknown } }) {
-  await fetch(`${API}/api/rooms/${roomId.value}/codex/respond`, {
+  const response = await apiFetch(`/api/rooms/${roomId.value}/codex/respond`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ requestId, ...payload })
   });
+  if (!response.ok && response.status !== 400) {
+    throw new Error(`Failed to respond to Codex request (${response.status})`);
+  }
+}
+
+function cloneJsonValue<T>(value: T): T {
+  try {
+    return JSON.parse(JSON.stringify(value)) as T;
+  } catch {
+    return value;
+  }
+}
+
+function promptForOptionSelection(
+  question: string,
+  options: Array<{ label?: unknown; description?: unknown }>,
+  allowOther: boolean
+): string[] | null {
+  const lines = [
+    question,
+    '',
+    ...options.map((option, index) => {
+      const label = typeof option?.label === 'string' ? option.label : `Option ${index + 1}`;
+      const description = typeof option?.description === 'string' && option.description.trim()
+        ? ` — ${option.description.trim()}`
+        : '';
+      return `${index + 1}. ${label}${description}`;
+    }),
+    allowOther ? '' : '',
+    allowOther ? 'Enter a number from the list or type your own answer.' : 'Enter a number from the list.'
+  ].filter(Boolean);
+  const raw = window.prompt(lines.join('\n'));
+  if (raw === null) return null;
+  const value = raw.trim();
+  if (!value) return [];
+  const numeric = Number(value);
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= options.length) {
+    const label = options[numeric - 1]?.label;
+    return typeof label === 'string' && label.trim() ? [label.trim()] : [];
+  }
+  return allowOther ? [value] : [];
+}
+
+async function collectToolRequestUserInputResponse(params: any) {
+  const questions = Array.isArray(params?.questions) ? params.questions.slice(0, 3) : [];
+  const answers: Record<string, { answers: string[] }> = {};
+
+  for (let index = 0; index < questions.length; index += 1) {
+    const question = questions[index] ?? {};
+    const id =
+      typeof question?.id === 'string' && question.id.trim()
+        ? question.id.trim()
+        : `q_${index + 1}`;
+    const header =
+      typeof question?.header === 'string' && question.header.trim()
+        ? `${question.header.trim()}\n`
+        : '';
+    const promptText =
+      typeof question?.question === 'string' && question.question.trim()
+        ? question.question.trim()
+        : `Question ${index + 1}`;
+    const options = Array.isArray(question?.options) ? question.options : [];
+    const allowOther = Boolean(question?.isOther);
+
+    const selectedAnswers =
+      options.length > 0
+        ? promptForOptionSelection(`${header}${promptText}`.trim(), options, allowOther)
+        : (() => {
+            const raw = window.prompt(`${header}${promptText}`.trim());
+            if (raw === null) return null;
+            const value = raw.trim();
+            return value ? [value] : [];
+          })();
+
+    if (selectedAnswers === null) {
+      answers[id] = { answers: [] };
+      continue;
+    }
+
+    answers[id] = { answers: selectedAnswers };
+  }
+
+  return { answers };
+}
+
+function summarizePermissionsRequest(params: any): string {
+  const reason = typeof params?.reason === 'string' ? params.reason.trim() : '';
+  const permissions =
+    params?.permissions && typeof params.permissions === 'object'
+      ? JSON.stringify(params.permissions, null, 2)
+      : '{}';
+  return [reason, permissions].filter(Boolean).join('\n\n').trim();
+}
+
+async function respondToPermissionsRequest(requestId: number | string, params: any) {
+  const requestedPermissions =
+    params?.permissions && typeof params.permissions === 'object'
+      ? cloneJsonValue(params.permissions)
+      : {};
+  const accepted =
+    accessMode.value === 'full-access'
+      ? true
+      : window.confirm(`Grant requested permissions?\n\n${summarizePermissionsRequest(params)}`);
+
+  pushEntry({
+    side: 'right',
+    label: 'codex',
+    text: accepted
+      ? `Item: permission_request\nGranted permissions${typeof params?.reason === 'string' ? `\n${params.reason}` : ''}`
+      : `Item: permission_request\nPermission request declined${typeof params?.reason === 'string' ? `\n${params.reason}` : ''}`,
+    at: new Date().toISOString(),
+    meta: { kind: 'codex.item', itemType: 'permission_request' }
+  });
+
+  await codexRespond(requestId, {
+    result: accepted
+      ? {
+          scope: accessMode.value === 'full-access' ? 'session' : 'turn',
+          permissions: requestedPermissions
+        }
+      : {
+          scope: 'turn',
+          permissions: {}
+        }
+  });
+}
+
+async function respondToMcpServerElicitation(requestId: number | string, params: any) {
+  const mode = typeof params?.mode === 'string' ? params.mode : '';
+  const message = typeof params?.message === 'string' ? params.message.trim() : 'MCP server requests input';
+
+  if (mode === 'url' && typeof params?.url === 'string' && params.url.trim()) {
+    const accepted = window.confirm(`${message}\n\nOpen URL?\n${params.url}`);
+    if (accepted) {
+      window.open(params.url, '_blank', 'noopener,noreferrer');
+    }
+    await codexRespond(requestId, {
+      result: {
+        action: accepted ? 'accept' : 'cancel',
+        content: null
+      }
+    });
+    return;
+  }
+
+  if (mode === 'form') {
+    while (true) {
+      const raw = window.prompt(
+        `${message}\n\nProvide JSON matching the requested schema:`,
+        '{}'
+      );
+      if (raw === null) {
+        await codexRespond(requestId, {
+          result: { action: 'cancel', content: null }
+        });
+        return;
+      }
+      const trimmed = raw.trim();
+      try {
+        const content = trimmed ? JSON.parse(trimmed) : {};
+        await codexRespond(requestId, {
+          result: { action: 'accept', content }
+        });
+        return;
+      } catch {
+        window.alert('Invalid JSON. Try again or press Cancel.');
+      }
+    }
+  }
 }
 
 function readPromptFromTurn(turn: any): string {
@@ -1353,18 +1655,31 @@ function readFinalResponseFromTurn(turn: any): string {
 function replayTurnsFromThreadRead(thread: any) {
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
   for (const turn of turns) {
+    const turnId = typeof turn?.id === 'string' ? turn.id : null;
     const baseAt =
       typeof turn?.createdAt === 'string'
         ? turn.createdAt
         : typeof turn?.created_at === 'string'
           ? turn.created_at
           : new Date().toISOString();
-    appendCodexTurnStarted(readPromptFromTurn(turn) || '(resumed turn)', baseAt);
+    appendCodexTurnStarted(
+      readPromptFromTurn(turn) || '(resumed turn)',
+      baseAt,
+      typeof turn?.model === 'string' ? turn.model : undefined,
+      typeof turn?.effort === 'string'
+        ? turn.effort
+        : typeof turn?.reasoningEffort === 'string'
+          ? turn.reasoningEffort
+          : undefined
+    );
     const items = Array.isArray(turn?.items) ? turn.items : [];
     for (const item of items) {
       if (!item || typeof item !== 'object') continue;
-    if (codexItemTypeForUi(item) === 'user_message') continue;
-    appendCodexItemTimeline(item as Record<string, unknown>, baseAt);
+      if (codexItemTypeForUi(item) === 'user_message') continue;
+      appendCodexItemTimeline(item as Record<string, unknown>, baseAt, {
+        turnId,
+        itemId: codexItemIdFrom(item)
+      });
     }
     const status = typeof turn?.status === 'string' ? turn.status : 'completed';
     const endAt =
@@ -1376,12 +1691,14 @@ function replayTurnsFromThreadRead(thread: any) {
     if (status === 'failed') {
       appendCodexTurnTerminal('failed', endAt, { error: turn?.error?.message ?? 'Turn failed' });
     } else if (status === 'interrupted') {
-      appendCodexTurnTerminal('failed', endAt, { error: 'Turn interrupted' });
-    } else {
+      appendCodexTurnTerminal('interrupted', endAt);
+    } else if (status === 'completed') {
       appendCodexTurnTerminal('completed', endAt, {
         finalResponse: readFinalResponseFromTurn(turn),
         usage: extractCodexUsagePayload(turn) ?? turn?.usage ?? turn?.tokenUsage ?? turn?.token_usage
       });
+    } else if (status === 'inProgress') {
+      activeCodexTurnId = typeof turn?.id === 'string' ? turn.id : activeCodexTurnId;
     }
   }
 }
@@ -1389,22 +1706,6 @@ function replayTurnsFromThreadRead(thread: any) {
 function applyCodexNotification(message: CodexRpcMessage, at: string) {
   const method = typeof message.method === 'string' ? message.method : '';
   const params = (message.params ?? {}) as any;
-  try {
-    const signature = `${method}|${JSON.stringify(params)}`;
-    const atMs = Date.parse(at);
-    if (
-      signature === lastCodexNotificationSignature &&
-      Number.isFinite(atMs) &&
-      atMs - lastCodexNotificationAtMs >= 0 &&
-      atMs - lastCodexNotificationAtMs < 250
-    ) {
-      return;
-    }
-    lastCodexNotificationSignature = signature;
-    lastCodexNotificationAtMs = Number.isFinite(atMs) ? atMs : Date.now();
-  } catch {
-    // best-effort dedupe only
-  }
   const ensureLiveTurnStarted = () => {
     if (running.value) return;
     const lastUserEntry = [...logEntries.value]
@@ -1416,180 +1717,6 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   if (method.startsWith('codex/event/')) {
     const msg = params?.msg ?? {};
     const rawType = typeof msg?.type === 'string' ? msg.type : '';
-    const rawTurnId =
-      (typeof msg?.turn_id === 'string' && msg.turn_id) ||
-      (typeof params?.id === 'string' && params.id) ||
-      null;
-
-    if (rawType === 'item_started') {
-      ensureLiveTurnStarted();
-      const item = (msg?.item && typeof msg.item === 'object' ? msg.item : null) as Record<string, unknown> | null;
-      const itemId = codexItemIdFrom(item);
-      if (itemId && item) liveCodexItemState.set(itemId, item);
-      return;
-    }
-
-    if (rawType === 'agent_message_content_delta') {
-      ensureLiveTurnStarted();
-      const itemId = codexItemIdFrom(msg);
-      const delta = msg?.delta ?? '';
-      if (itemId && typeof delta === 'string') {
-        const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'agent_message' };
-        appendCodexTextField(state, 'text', delta);
-        liveCodexItemState.set(itemId, state);
-      }
-      return;
-    }
-
-    // Older raw stream can emit duplicate aggregate agent deltas without item id.
-    if (rawType === 'agent_message_delta') {
-      return;
-    }
-
-    if (rawType === 'reasoning_summary_text_delta' || rawType === 'reasoning_summary_delta') {
-      ensureLiveTurnStarted();
-      const itemId = codexItemIdFrom(msg);
-      const delta = msg?.delta ?? msg?.text ?? '';
-      if (!itemId || typeof delta !== 'string') return;
-      const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'reasoning' };
-      const summary = (state.summary ?? {}) as Record<string, unknown>;
-      appendCodexTextField(summary, 'text', delta);
-      state.summary = summary;
-      liveCodexItemState.set(itemId, state);
-      return;
-    }
-
-    if (rawType === 'agent_reasoning_delta' || rawType === 'agent_reasoning') {
-      // Aggregate duplicates of item-scoped reasoning events; ignore to avoid duplicated "think".
-      return;
-    }
-
-    if (rawType === 'reasoning_text_delta' || rawType === 'reasoning_content_delta' || rawType === 'reasoning_delta') {
-      ensureLiveTurnStarted();
-      const itemId = codexItemIdFrom(msg);
-      const delta = msg?.delta ?? msg?.text ?? '';
-      if (!itemId || typeof delta !== 'string') return;
-      const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'reasoning' };
-      const isSummaryStream =
-        typeof msg?.summary_index === 'number' ||
-        typeof msg?.summaryIndex === 'number';
-      const targetKey = isSummaryStream ? 'summary' : 'content';
-      const nested = (state[targetKey] ?? {}) as Record<string, unknown>;
-      appendCodexTextField(nested, 'text', delta);
-      state[targetKey] = nested;
-      liveCodexItemState.set(itemId, state);
-      return;
-    }
-
-    if (rawType === 'exec_command_output_delta') {
-      ensureLiveTurnStarted();
-      const itemId = codexItemIdFrom(msg);
-      const chunk = typeof msg?.chunk === 'string' ? msg.chunk : '';
-      if (!itemId || !chunk) return;
-      let delta = '';
-      try {
-        delta = atob(chunk);
-      } catch {
-        delta = '';
-      }
-      if (!delta) return;
-      const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
-      const itemType = codexItemTypeForUi(state);
-      if (itemType === 'file_change') appendCodexTextField(state, 'outputDelta', delta);
-      else appendCodexTextField(state, 'aggregatedOutput', delta);
-      liveCodexItemState.set(itemId, state);
-      return;
-    }
-
-    if (rawType === 'exec_command_begin') {
-      ensureLiveTurnStarted();
-      const itemId = codexItemIdFrom(msg);
-      if (!itemId) return;
-      const commandArray = Array.isArray(msg?.command) ? msg.command.filter((x: unknown) => typeof x === 'string') as string[] : [];
-      const parsedCmd = Array.isArray(msg?.parsed_cmd) ? msg.parsed_cmd : Array.isArray(msg?.parsedCmd) ? msg.parsedCmd : [];
-      const commandActions = parsedCmd.map((entry: any) => ({
-        type: typeof entry?.type === 'string' ? entry.type : 'unknown',
-        command: typeof entry?.command === 'string' ? entry.command : typeof entry?.cmd === 'string' ? entry.cmd : undefined
-      }));
-      const state: Record<string, unknown> = {
-        id: itemId,
-        type: 'command_execution',
-        status: 'inProgress',
-        command: commandArray.length ? commandArray.join(' ') : msg?.command,
-        cwd: typeof msg?.cwd === 'string' ? msg.cwd : undefined,
-        processId:
-          (typeof msg?.process_id === 'string' && msg.process_id) ||
-          (typeof msg?.processId === 'string' && msg.processId) ||
-          undefined,
-        commandActions
-      };
-      liveCodexItemState.set(itemId, state);
-      return;
-    }
-
-    if (rawType === 'exec_command_end') {
-      ensureLiveTurnStarted();
-      const itemId = codexItemIdFrom(msg);
-      if (!itemId) return;
-      const base = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
-      const durationSecs = Number((msg?.duration as any)?.secs ?? 0);
-      const durationNanos = Number((msg?.duration as any)?.nanos ?? 0);
-      const durationMs =
-        Number.isFinite(durationSecs) && Number.isFinite(durationNanos)
-          ? Math.round(durationSecs * 1000 + durationNanos / 1_000_000)
-          : undefined;
-      const merged: Record<string, unknown> = {
-        ...base,
-        status: typeof msg?.status === 'string' ? msg.status : 'completed',
-        command: Array.isArray(msg?.command)
-          ? (msg.command.filter((x: unknown) => typeof x === 'string') as string[]).join(' ')
-          : (base as any).command,
-        cwd: typeof msg?.cwd === 'string' ? msg.cwd : (base as any).cwd,
-        processId:
-          (typeof msg?.process_id === 'string' && msg.process_id) ||
-          (typeof msg?.processId === 'string' && msg.processId) ||
-          (base as any).processId,
-        exitCode:
-          msg?.exit_code !== undefined ? msg.exit_code : msg?.exitCode !== undefined ? msg.exitCode : (base as any).exitCode,
-        durationMs: durationMs ?? (base as any).durationMs,
-        stdout: typeof msg?.stdout === 'string' ? msg.stdout : (base as any).stdout,
-        stderr: typeof msg?.stderr === 'string' ? msg.stderr : (base as any).stderr,
-        aggregatedOutput:
-          typeof msg?.aggregated_output === 'string'
-            ? msg.aggregated_output
-            : typeof msg?.formatted_output === 'string'
-              ? msg.formatted_output
-              : (base as any).aggregatedOutput
-      };
-      liveCodexItemState.delete(itemId);
-      appendCodexItemTimeline(merged, at, {
-        turnId: rawTurnId,
-        itemId
-      });
-      return;
-    }
-
-    if (rawType === 'turn_diff') {
-      ensureLiveTurnStarted();
-      const patch =
-        (typeof msg?.unified_diff === 'string' && msg.unified_diff) ||
-        (typeof msg?.diff === 'string' && msg.diff) ||
-        '';
-      if (rawTurnId && patch.trim()) latestTurnDiffPatchByTurnId.set(rawTurnId, patch);
-      const patched = patchFileChangeEntryForTurn(rawTurnId, patch, at);
-      if (!patched && patch.trim()) {
-        appendCodexItemTimeline(
-          {
-            type: 'turn_diff',
-            diff: patch,
-            source: 'codex.event.turn_diff'
-          },
-          at,
-          { turnId: rawTurnId }
-        );
-      }
-      return;
-    }
 
     if (rawType === 'token_count') {
       if (msg?.info && typeof msg.info === 'object') {
@@ -1610,56 +1737,10 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
           },
           modelContextWindow: (msg.info as any)?.model_context_window
         };
+        latestUsageFromEvent.value = usageFromEvent(latestThreadUsageRaw);
       }
       return;
     }
-
-    if (rawType === 'item_completed') {
-      ensureLiveTurnStarted();
-      const item = (msg?.item && typeof msg.item === 'object' ? msg.item : { type: 'unknown' }) as Record<string, unknown>;
-      const itemId = codexItemIdFrom(item);
-      const base = itemId ? liveCodexItemState.get(itemId) : undefined;
-      const merged = base ? ({ ...base, ...item } as Record<string, unknown>) : item;
-      if (itemId) {
-        liveCodexItemState.delete(itemId);
-      }
-      appendCodexItemTimeline(merged, at, {
-        turnId: rawTurnId,
-        itemId
-      });
-      return;
-    }
-
-    if (rawType === 'agent_message') {
-      // Final agent message is already handled via raw item_completed (or legacy item/completed).
-      return;
-    }
-
-    if (rawType === 'task_complete') {
-      if (!running.value) return;
-      const status = typeof msg?.status === 'string' ? msg.status : 'completed';
-      if (status === 'failed') {
-        appendCodexTurnTerminal('failed', at, { error: msg?.error?.message ?? msg?.error ?? 'Turn failed' });
-        return;
-      }
-      appendCodexTurnTerminal('completed', at, {
-        finalResponse: typeof msg?.final_response === 'string' ? msg.final_response : '',
-        usage: latestThreadUsageRaw
-      });
-      return;
-    }
-
-    if (rawType === 'task_started') {
-      if (typeof rawTurnId === 'string') activeCodexTurnId = rawTurnId;
-      if (!running.value) {
-        const lastUserEntry = [...logEntries.value]
-          .reverse()
-          .find((entry) => getEntryKind(entry) === 'user.message');
-        appendCodexTurnStarted(lastUserEntry?.text ?? '(running turn)', at);
-      }
-      return;
-    }
-
     return;
   }
 
@@ -1669,35 +1750,154 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     return;
   }
 
+  if (method === 'thread/closed') {
+    activeCodexTurnId = null;
+    latestTurnDiffPatchByTurnId.clear();
+    stopWorkingTimer(at);
+    return;
+  }
+
+  if (method === 'thread/status/changed') {
+    const status = typeof params?.status === 'string' ? params.status : '';
+    if (status === 'notLoaded') {
+      activeCodexTurnId = null;
+      latestTurnDiffPatchByTurnId.clear();
+      stopWorkingTimer(at);
+    }
+    return;
+  }
+
   if (method === 'thread/tokenUsage/updated') {
     latestThreadUsageRaw = extractCodexUsagePayload(params) ?? params;
+    latestUsageFromEvent.value = usageFromEvent(latestThreadUsageRaw);
     return;
   }
 
   if (method === 'turn/started') {
     const turn = params?.turn ?? {};
     if (typeof turn?.id === 'string') activeCodexTurnId = turn.id;
+    latestThreadUsageRaw = null;
+    latestUsageFromEvent.value = null;
     if (!running.value) {
       const lastUserEntry = [...logEntries.value]
         .reverse()
         .find((entry) => getEntryKind(entry) === 'user.message');
-      appendCodexTurnStarted(lastUserEntry?.text ?? '(running turn)', at);
+      appendCodexTurnStarted(
+        lastUserEntry?.text ?? '(running turn)',
+        at,
+        typeof turn?.model === 'string' ? turn.model : undefined,
+        typeof turn?.effort === 'string'
+          ? turn.effort
+          : typeof turn?.reasoningEffort === 'string'
+            ? turn.reasoningEffort
+            : undefined
+      );
     }
     return;
   }
 
-  // Raw `codex/event/*` is the primary source of truth. Ignore duplicate legacy item/diff events.
-  if (
-    method === 'item/started' ||
-    method === 'item/agentMessage/delta' ||
-    method === 'item/plan/delta' ||
-    method === 'item/reasoning/summaryTextDelta' ||
-    method === 'item/reasoning/textDelta' ||
-    method === 'item/commandExecution/outputDelta' ||
-    method === 'item/fileChange/outputDelta' ||
-    method === 'item/completed' ||
-    method === 'turn/diff/updated'
-  ) {
+  if (method === 'item/started') {
+    ensureLiveTurnStarted();
+    const item = (params?.item && typeof params.item === 'object'
+      ? params.item
+      : { type: 'unknown' }) as Record<string, unknown>;
+    const itemId = codexItemIdFrom(item);
+    if (itemId) liveCodexItemState.set(itemId, item);
+    return;
+  }
+
+  if (method === 'item/agentMessage/delta') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    const delta = params?.delta ?? params?.textDelta ?? params?.text ?? '';
+    if (!itemId || typeof delta !== 'string') return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'agent_message' };
+    appendCodexTextField(state, 'text', delta);
+    liveCodexItemState.set(itemId, state);
+    return;
+  }
+
+  if (method === 'item/plan/delta') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    const delta = params?.delta ?? params?.textDelta ?? params?.text ?? '';
+    if (!itemId || typeof delta !== 'string') return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'plan' };
+    appendCodexTextField(state, 'text', delta);
+    liveCodexItemState.set(itemId, state);
+    return;
+  }
+
+  if (method === 'item/reasoning/summaryTextDelta') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    const delta = params?.delta ?? params?.textDelta ?? params?.text ?? '';
+    if (!itemId || typeof delta !== 'string') return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'reasoning' };
+    const summary = (state.summary ?? {}) as Record<string, unknown>;
+    appendCodexTextField(summary, 'text', delta);
+    state.summary = summary;
+    liveCodexItemState.set(itemId, state);
+    return;
+  }
+
+  if (method === 'item/reasoning/textDelta') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    const delta = params?.delta ?? params?.textDelta ?? params?.text ?? '';
+    if (!itemId || typeof delta !== 'string') return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'reasoning' };
+    const content = (state.content ?? {}) as Record<string, unknown>;
+    appendCodexTextField(content, 'text', delta);
+    state.content = content;
+    liveCodexItemState.set(itemId, state);
+    return;
+  }
+
+  if (method === 'item/commandExecution/outputDelta') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    const delta = params?.delta ?? params?.outputDelta ?? params?.output ?? '';
+    if (!itemId || typeof delta !== 'string') return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
+    appendCodexTextField(state, 'aggregatedOutput', delta);
+    liveCodexItemState.set(itemId, state);
+    return;
+  }
+
+  if (method === 'item/fileChange/outputDelta') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    const delta = params?.delta ?? params?.outputDelta ?? params?.output ?? '';
+    if (!itemId || typeof delta !== 'string') return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'file_change' };
+    appendCodexTextField(state, 'outputDelta', delta);
+    liveCodexItemState.set(itemId, state);
+    return;
+  }
+
+  if (method === 'item/completed') {
+    ensureLiveTurnStarted();
+    const item = (params?.item && typeof params.item === 'object'
+      ? params.item
+      : { type: 'unknown' }) as Record<string, unknown>;
+    const itemId = codexItemIdFrom(item);
+    const base = itemId ? liveCodexItemState.get(itemId) : undefined;
+    const merged = base ? ({ ...base, ...item } as Record<string, unknown>) : item;
+    if (itemId) liveCodexItemState.delete(itemId);
+    appendCodexItemTimeline(merged, at, {
+      turnId: typeof params?.turnId === 'string' ? params.turnId : activeCodexTurnId,
+      itemId
+    });
+    return;
+  }
+
+  if (method === 'turn/diff/updated') {
+    ensureLiveTurnStarted();
+    const turnId = typeof params?.turnId === 'string' ? params.turnId : null;
+    const patch = typeof params?.diff === 'string' ? params.diff : '';
+    if (turnId && patch.trim()) latestTurnDiffPatchByTurnId.set(turnId, patch);
+    upsertTurnDiffEntryForTurn(turnId, patch, at);
     return;
   }
 
@@ -1742,7 +1942,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       return;
     }
     if (status === 'interrupted') {
-      appendCodexTurnTerminal('failed', at, { error: 'Turn interrupted' });
+      appendCodexTurnTerminal('interrupted', at);
       return;
     }
     appendCodexTurnTerminal('completed', at, {
@@ -1761,23 +1961,56 @@ async function handleCodexServerRequest(message: CodexRpcMessage) {
   const params = (message.params ?? {}) as any;
 
   if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    const decision =
+      accessMode.value === 'full-access'
+        ? 'acceptForSession'
+        : window.confirm(
+            method === 'item/fileChange/requestApproval'
+              ? `Approve file change?\n\n${typeof params?.reason === 'string' ? params.reason : ''}`.trim()
+              : `Approve command?\n\n${
+                  typeof params?.command === 'string'
+                    ? params.command
+                    : Array.isArray(params?.commandActions)
+                      ? params.commandActions
+                          .map((entry: any) => entry?.command)
+                          .filter((entry: unknown) => typeof entry === 'string')
+                          .join('\n')
+                      : ''
+                }\n${typeof params?.reason === 'string' ? `\n${params.reason}` : ''}`.trim()
+          )
+          ? 'acceptForSession'
+          : 'decline';
+
     appendCodexItemTimeline(
       {
         type: method === 'item/fileChange/requestApproval' ? 'fileChange' : 'commandExecution',
         id: codexItemIdFrom(params) ?? undefined,
         status: 'awaiting_approval',
-        approval: { decision: 'acceptForSession', source: 'frontend-auto', method }
+        approval: {
+          decision,
+          source: accessMode.value === 'full-access' ? 'frontend-auto' : 'frontend-confirm',
+          method
+        }
       },
       new Date().toISOString()
     );
-    await codexRespond(requestId, { result: 'acceptForSession' });
+    await codexRespond(requestId, { result: { decision } });
+    return;
+  }
+
+  if (method === 'item/permissions/requestApproval') {
+    await respondToPermissionsRequest(requestId, params);
     return;
   }
 
   if (method === 'tool/requestUserInput') {
-    await codexRespond(requestId, {
-      error: { code: -32601, message: 'tool/requestUserInput is not supported by this client' }
-    });
+    const result = await collectToolRequestUserInputResponse(params);
+    await codexRespond(requestId, { result });
+    return;
+  }
+
+  if (method === 'mcpServer/elicitation/request') {
+    await respondToMcpServerElicitation(requestId, params);
     return;
   }
 
@@ -1793,17 +2026,32 @@ async function handleCodexServerRequest(message: CodexRpcMessage) {
   });
 }
 
-async function scrollToBottom() {
-  await nextTick();
-  if (timelineEl.value) {
-    timelineEl.value.scrollTop = timelineEl.value.scrollHeight;
-  }
+function isTimelineNearBottom(thresholdPx = 48): boolean {
+  const el = timelineEl.value;
+  if (!el) return true;
+  const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  return distanceToBottom <= thresholdPx;
 }
 
-watch(logEntries, scrollToBottom);
+function onTimelineScroll() {
+  shouldAutoScrollTimeline.value = isTimelineNearBottom();
+}
+
+async function scrollToBottom(force = false) {
+  await nextTick();
+  const el = timelineEl.value;
+  if (!el) return;
+  if (!force && !shouldAutoScrollTimeline.value) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+watch(logEntries, () => {
+  void scrollToBottom(false);
+});
 
 async function loadState() {
-  const response = await fetch(`${API}/api/rooms/${roomId.value}/state`);
+  const response = await apiFetch(`/api/rooms/${roomId.value}/state`);
+  if (!response.ok) throw new Error(`Failed to load room state (${response.status})`);
   const data = await response.json();
   usageByTurnAt.value = new Map();
   latestUsageFromEvent.value = null;
@@ -1823,13 +2071,11 @@ async function loadState() {
 
   logEntries.value = history;
   editorText.value = data.editor.text;
+  editorVersion.value = typeof data.editor?.version === 'number' ? data.editor.version : 0;
   editorCursors.value = Array.isArray(data.editor?.cursors) ? data.editor.cursors : [];
 
   if (currentThreadId.value) {
     try {
-      await codexRpc('thread/resume', {
-        threadId: currentThreadId.value
-      });
       const replay = await codexRpc('thread/read', {
         threadId: currentThreadId.value,
         includeTurns: true
@@ -1855,7 +2101,7 @@ async function loadState() {
       hasTerminalAfterLastStart = false;
       continue;
     }
-    if (lastStarted && (kind === 'codex.completed' || kind === 'codex.failed')) {
+    if (lastStarted && (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted')) {
       hasTerminalAfterLastStart = true;
     }
   }
@@ -1869,16 +2115,59 @@ async function loadState() {
 }
 
 async function loadRuntime() {
-  const response = await fetch(`${API}/api/runtime`);
+  const response = await apiFetch('/api/runtime');
+  if (!response.ok) throw new Error(`Failed to load runtime (${response.status})`);
   const data = await response.json();
   workingDirectory.value = data.workingDirectory ?? '';
+  const runtimeModel = typeof data.codexModel === 'string' ? data.codexModel : 'default';
+  selectedModel.value = runtimeModel && runtimeModel !== 'default' ? runtimeModel : 'default';
 }
 
 async function loadCodexThreads() {
-  const response = await fetch(`${API}/api/codex/threads?limit=40`);
+  const response = await apiFetch('/api/codex/threads?limit=40');
   if (!response.ok) return;
   const data = (await response.json()) as { data?: CodexThreadSummary[] };
   codexThreads.value = Array.isArray(data.data) ? data.data : [];
+}
+
+async function loadModels() {
+  try {
+    const result = await codexRpc('model/list', {
+      limit: 100,
+      includeHidden: false
+    });
+    const data = Array.isArray(result?.data) ? result.data : [];
+    const options: ModelOption[] = data
+      .map((entry: any) => {
+        const id = typeof entry?.id === 'string' ? entry.id : '';
+        if (!id) return null;
+        return {
+          id,
+          label:
+            (typeof entry?.displayName === 'string' && entry.displayName.trim()) ||
+            (typeof entry?.model === 'string' && entry.model.trim()) ||
+            id,
+          isDefault: Boolean(entry?.isDefault)
+        } satisfies ModelOption;
+      })
+      .filter((entry: ModelOption | null): entry is ModelOption => Boolean(entry));
+    const defaultVisibleOption = options.find((entry) => entry.isDefault) ?? null;
+    const defaultPickerLabel = defaultVisibleOption
+      ? `Default · ${defaultVisibleOption.label}`
+      : 'Project Default';
+
+    const withDefault =
+      selectedModel.value === 'default' || !options.some((entry) => entry.id === selectedModel.value)
+        ? [{ id: 'default', label: defaultPickerLabel }, ...options]
+        : options;
+
+    modelOptions.value = withDefault;
+    if (!withDefault.some((entry) => entry.id === selectedModel.value)) {
+      selectedModel.value = withDefault[0]?.id ?? 'default';
+    }
+  } catch {
+    modelOptions.value = [{ id: 'default', label: 'Project Default', isDefault: true }];
+  }
 }
 
 function looksLikeCodexThreadId(value: string): boolean {
@@ -1888,11 +2177,12 @@ function looksLikeCodexThreadId(value: string): boolean {
 }
 
 async function hydrateRoomFromThreadId(threadId: string) {
-  await fetch(`${API}/api/rooms/${encodeURIComponent(threadId)}/thread`, {
+  const response = await apiFetch(`/api/rooms/${encodeURIComponent(threadId)}/thread`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ threadId })
   });
+  if (!response.ok) throw new Error(`Failed to hydrate room from thread (${response.status})`);
 }
 
 async function switchRoom(nextRoomId: string) {
@@ -1913,8 +2203,10 @@ async function switchRoom(nextRoomId: string) {
 
   view.value = 'chat';
   await loadState();
+  await loadModels();
+  shouldAutoScrollTimeline.value = true;
   connectEvents();
-  scrollToBottom();
+  scrollToBottom(true);
 }
 
 function goHome() {
@@ -1938,11 +2230,12 @@ async function openCodexThread(threadId: string) {
   const room = threadId.trim();
   if (!room) return;
 
-  await fetch(`${API}/api/rooms/${encodeURIComponent(room)}/thread`, {
+  const response = await apiFetch(`/api/rooms/${encodeURIComponent(room)}/thread`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ threadId: room })
   });
+  if (!response.ok) throw new Error(`Failed to open Codex thread (${response.status})`);
 
   await switchRoom(room);
   await loadCodexThreads();
@@ -1958,10 +2251,13 @@ function connectEvents() {
   const read = async () => {
     while (!controller.signal.aborted && seq === eventsConnectionSeq) {
       try {
-        const response = await fetch(`${API}/api/rooms/${roomId.value}/events`, {
+        const response = await apiFetch(`/api/rooms/${roomId.value}/events`, {
           method: 'POST',
           signal: controller.signal
         });
+        if (!response.ok) {
+          throw new Error(`Events stream failed (${response.status})`);
+        }
 
         if (!response.body) break;
 
@@ -1986,9 +2282,16 @@ function connectEvents() {
 
             if (dataLines.length > 0) {
               const raw = dataLines.join('\n');
-              let event: RoomEvent | { type: 'system.connected' } | null = null;
+              let event:
+                | RoomEvent
+                | { type: 'system.connected'; at?: string }
+                | { type: 'system.heartbeat'; at?: string }
+                | null = null;
               try {
-                event = JSON.parse(raw) as RoomEvent | { type: 'system.connected' };
+                event = JSON.parse(raw) as
+                  | RoomEvent
+                  | { type: 'system.connected'; at?: string }
+                  | { type: 'system.heartbeat'; at?: string };
               } catch {
                 event = null;
               }
@@ -2006,12 +2309,14 @@ function connectEvents() {
                       running.value = true;
                       startWorkingTimer(event.entry.at);
                     }
-                    if (kind === 'codex.completed' || kind === 'codex.failed') {
+                    if (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted') {
                       stopWorkingTimer(event.entry.at);
                     }
                   }
                   break;
                 case 'editor.updated':
+                  editorVersion.value =
+                    typeof event.editor.version === 'number' ? event.editor.version : editorVersion.value;
                   editorCursors.value = Array.isArray(event.editor.cursors) ? event.editor.cursors : [];
                   if (event.editor.updatedBy !== userId.value) {
                     applyingRemoteEditorUpdate = true;
@@ -2028,6 +2333,15 @@ function connectEvents() {
                   pushDebugEvent(event.type, event.at, event.message);
                   void handleCodexServerRequest(event.message);
                   break;
+                case 'system.connected':
+                  apiError.value = null;
+                  break;
+                case 'system.queueOverflow':
+                  apiError.value = 'Events backlog overflowed. Resyncing…';
+                  await loadState();
+                  break;
+                case 'system.heartbeat':
+                  break;
                 default:
                   break;
               }
@@ -2035,8 +2349,10 @@ function connectEvents() {
             delimiterIndex = buffer.indexOf('\n\n');
           }
         }
-      } catch {
-        // reconnect below
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          apiError.value = error instanceof Error ? `${error.message}. Reconnecting…` : 'Events stream disconnected. Reconnecting…';
+        }
       }
       if (seq !== eventsConnectionSeq || controller.signal.aborted) break;
       await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -2047,17 +2363,42 @@ function connectEvents() {
 
 async function syncEditor() {
   const el = editorEl.value;
-  await fetch(`${API}/api/rooms/${roomId.value}/editor`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      userId: userId.value,
-      userName: userName.value,
-      text: editorText.value,
-      selectionStart: el?.selectionStart ?? editorText.value.length,
-      selectionEnd: el?.selectionEnd ?? editorText.value.length
-    })
-  });
+  try {
+    const response = await apiFetch(`/api/rooms/${roomId.value}/editor`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: userId.value,
+        userName: userName.value,
+        text: editorText.value,
+        baseVersion: editorVersion.value,
+        selectionStart: el?.selectionStart ?? editorText.value.length,
+        selectionEnd: el?.selectionEnd ?? editorText.value.length
+      })
+    });
+    if (response.status === 409) {
+      const data = (await response.json().catch(() => ({}))) as { editor?: any; error?: string };
+      const serverEditor = data.editor;
+      if (serverEditor && typeof serverEditor.text === 'string') {
+        applyingRemoteEditorUpdate = true;
+        editorText.value = serverEditor.text;
+        editorVersion.value =
+          typeof serverEditor.version === 'number' ? serverEditor.version : editorVersion.value;
+        editorCursors.value = Array.isArray(serverEditor.cursors) ? serverEditor.cursors : editorCursors.value;
+        apiError.value = data.error ?? 'Prompt was changed by another collaborator. Your local draft was refreshed.';
+      }
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to sync editor (${response.status})`);
+    }
+    const editor = (await response.json().catch(() => null)) as any;
+    if (editor && typeof editor.version === 'number') {
+      editorVersion.value = editor.version;
+    }
+  } catch (error) {
+    apiError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 
 function scheduleEditorSync(delayMs = 120) {
@@ -2088,11 +2429,19 @@ function onEditorScroll() {
   refreshCursorOverlays();
 }
 
+function onWindowPointerDown(event: PointerEvent) {
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  if (modelMenuEl.value?.contains(target)) return;
+  if (accessMenuEl.value?.contains(target)) return;
+  closeMenus();
+}
+
 async function runCodex() {
   if (!canRun.value) return false;
   const prompt = editorText.value.trim();
   if (!prompt) return false;
-  await fetch(`${API}/api/rooms/${roomId.value}/messages`, {
+  const messageResponse = await apiFetch(`/api/rooms/${roomId.value}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2101,15 +2450,23 @@ async function runCodex() {
       text: prompt
     })
   });
+  if (!messageResponse.ok) throw new Error(`Failed to send message (${messageResponse.status})`);
   if (!currentThreadId.value) {
-    const started = await codexRpc('thread/start', {});
+    const started = await codexRpc('thread/start', {
+      ...(selectedModel.value !== 'default' ? { model: selectedModel.value } : {}),
+      approvalPolicy: approvalPolicyForMode(accessMode.value),
+      sandbox: sandboxModeForMode(accessMode.value)
+    });
     const threadId = typeof started?.thread?.id === 'string' ? started.thread.id : null;
     if (!threadId) throw new Error('Failed to create thread');
     currentThreadId.value = threadId;
   }
   const result = await codexRpc('turn/start', {
     threadId: currentThreadId.value,
-    input: [{ type: 'text', text: prompt }]
+    input: [{ type: 'text', text: prompt }],
+    ...(selectedModel.value !== 'default' ? { model: selectedModel.value } : {}),
+    approvalPolicy: approvalPolicyForMode(accessMode.value),
+    sandboxPolicy: sandboxPolicyForMode(accessMode.value)
   });
   activeCodexTurnId = typeof result?.turn?.id === 'string' ? result.turn.id : activeCodexTurnId;
   editorText.value = '';
@@ -2120,7 +2477,7 @@ async function steerCodex() {
   if (!canSteer.value) return false;
   const prompt = editorText.value.trim();
   if (!prompt || !currentThreadId.value || !activeCodexTurnId) return false;
-  await fetch(`${API}/api/rooms/${roomId.value}/messages`, {
+  const messageResponse = await apiFetch(`/api/rooms/${roomId.value}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2129,6 +2486,7 @@ async function steerCodex() {
       text: prompt
     })
   });
+  if (!messageResponse.ok) throw new Error(`Failed to send steer message (${messageResponse.status})`);
   await codexRpc('turn/steer', {
     threadId: currentThreadId.value,
     expectedTurnId: activeCodexTurnId,
@@ -2140,20 +2498,29 @@ async function steerCodex() {
 
 async function sendToCodex() {
   if (!canSubmit.value) return;
-  if (running.value) {
-    await steerCodex();
-    return;
+  try {
+    apiError.value = null;
+    if (running.value) {
+      await steerCodex();
+      return;
+    }
+    await runCodex();
+  } catch (error) {
+    apiError.value = error instanceof Error ? error.message : String(error);
   }
-  await runCodex();
 }
 
 async function interruptCodex() {
   if (!canInterrupt.value) return;
   if (!currentThreadId.value || !activeCodexTurnId) return;
-  await codexRpc('turn/interrupt', {
-    threadId: currentThreadId.value,
-    turnId: activeCodexTurnId
-  });
+  try {
+    await codexRpc('turn/interrupt', {
+      threadId: currentThreadId.value,
+      turnId: activeCodexTurnId
+    });
+  } catch (error) {
+    apiError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 
 function onEditorKeydown(event: KeyboardEvent) {
@@ -2164,27 +2531,35 @@ function onEditorKeydown(event: KeyboardEvent) {
 
 onMounted(async () => {
   window.addEventListener('resize', refreshCursorOverlays);
-  await loadRuntime();
-  await loadCodexThreads();
-  if (view.value === 'chat') {
-    if (looksLikeCodexThreadId(roomId.value)) {
-      try {
-        await hydrateRoomFromThreadId(roomId.value);
-      } catch {
-        // Fall back to persisted room state if hydration fails.
+  window.addEventListener('pointerdown', onWindowPointerDown);
+  try {
+    await loadRuntime();
+    await loadCodexThreads();
+    if (view.value === 'chat') {
+      if (looksLikeCodexThreadId(roomId.value)) {
+        try {
+          await hydrateRoomFromThreadId(roomId.value);
+        } catch {
+          // Fall back to persisted room state if hydration fails.
+        }
       }
+      await loadState();
+      await loadModels();
+      shouldAutoScrollTimeline.value = true;
+      connectEvents();
+      scrollToBottom(true);
+      await nextTick();
+      refreshCursorOverlays();
     }
-    await loadState();
-    connectEvents();
-    scrollToBottom();
-    await nextTick();
-    refreshCursorOverlays();
+  } catch (error) {
+    apiError.value = error instanceof Error ? error.message : String(error);
   }
 });
 
 onUnmounted(() => {
   eventsAbortController?.abort();
   window.removeEventListener('resize', refreshCursorOverlays);
+  window.removeEventListener('pointerdown', onWindowPointerDown);
   if (workingTimer) {
     window.clearInterval(workingTimer);
     workingTimer = null;
@@ -2239,6 +2614,13 @@ onUnmounted(() => {
       </div>
     </header>
 
+    <div
+      v-if="apiError"
+      class="shrink-0 border-b border-amber-200 bg-amber-50 px-5 py-2 text-[12px] text-amber-800"
+    >
+      {{ apiError }}
+    </div>
+
     <section v-if="view === 'home'" class="flex-1 overflow-y-auto">
       <div class="px-5 py-5 space-y-3">
         <div class="rounded-xl border border-neutral-200 bg-white p-3">
@@ -2274,7 +2656,7 @@ onUnmounted(() => {
     </section>
 
     <!-- Timeline -->
-    <section v-else class="flex-1 overflow-y-auto" ref="timelineEl">
+    <section v-else class="flex-1 overflow-y-auto" ref="timelineEl" @scroll.passive="onTimelineScroll">
       <div class="flex flex-col gap-3 px-5 py-5">
 
         <div v-if="groups.length === 0" class="py-10 text-sm text-neutral-500">
@@ -2446,12 +2828,13 @@ onUnmounted(() => {
     <!-- Input -->
     <footer v-if="view === 'chat'" class="shrink-0 border-t border-neutral-200 bg-white/95 backdrop-blur-sm">
       <div class="px-5 py-4">
-        <div class="relative">
+        <div class="space-y-3">
+          <div class="relative">
           <textarea
             ref="editorEl"
             v-model="editorText"
             rows="5"
-            class="w-full resize-none rounded-xl border border-neutral-200 bg-neutral-50 px-4 pb-11 pr-28 pt-3 font-sans text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-300 focus:border-neutral-400 focus:bg-white"
+            class="w-full resize-none rounded-xl border border-neutral-200 bg-neutral-50 px-4 pb-4 pt-3 font-sans text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-300 focus:border-neutral-400 focus:bg-white"
             placeholder="Write a prompt..."
             @keydown="onEditorKeydown"
             @click="onEditorSelectionChange"
@@ -2478,10 +2861,71 @@ onUnmounted(() => {
               </span>
             </div>
           </div>
-          <span class="pointer-events-none absolute bottom-3 left-4 text-[11px] text-neutral-400">
-            {{ contextAvailabilityText }}
-          </span>
-          <div class="absolute bottom-2 right-2 flex items-center gap-2">
+          </div>
+          <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+              <div ref="modelMenuEl" class="relative">
+                <button
+                  type="button"
+                  class="inline-flex min-w-[13rem] items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-[12px] text-neutral-800 shadow-sm transition-colors hover:bg-neutral-50"
+                  @click="toggleMenu('model')"
+                >
+                  <span class="truncate">{{ selectedModelOptionLabel }}</span>
+                  <span class="text-[10px] text-neutral-400">{{ openMenu === 'model' ? '▴' : '▾' }}</span>
+                </button>
+                <div
+                  v-if="openMenu === 'model'"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[18rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-xl"
+                >
+                  <button
+                    v-for="option in modelOptions"
+                    :key="option.id"
+                    type="button"
+                    class="flex w-full items-center justify-between gap-3 border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
+                    @click="selectModelOption(option.id)"
+                  >
+                    <span class="truncate">{{ option.label }}</span>
+                    <span v-if="selectedModel === option.id" class="text-[10px] text-neutral-400">current</span>
+                  </button>
+                </div>
+              </div>
+              <div ref="accessMenuEl" class="relative">
+                <button
+                  type="button"
+                  class="inline-flex min-w-[11rem] items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-[12px] text-neutral-800 shadow-sm transition-colors hover:bg-neutral-50"
+                  @click="toggleMenu('access')"
+                >
+                  <span class="truncate">{{ selectedAccessLabel }}</span>
+                  <span class="text-[10px] text-neutral-400">{{ openMenu === 'access' ? '▴' : '▾' }}</span>
+                </button>
+                <div
+                  v-if="openMenu === 'access'"
+                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 w-[14rem] overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-xl"
+                >
+                  <button
+                    type="button"
+                    class="flex w-full items-center justify-between gap-3 border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 hover:bg-neutral-50"
+                    @click="selectAccessMode('full-access')"
+                  >
+                    <span>Full Access</span>
+                    <span v-if="accessMode === 'full-access'" class="text-[10px] text-neutral-400">current</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-[12px] text-neutral-700 hover:bg-neutral-50"
+                    @click="selectAccessMode('need-approve')"
+                  >
+                    <span>Need Approve</span>
+                    <span v-if="accessMode === 'need-approve'" class="text-[10px] text-neutral-400">current</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="flex items-center justify-between gap-3 sm:justify-end">
+              <span class="text-[11px] text-neutral-400">
+                {{ contextAvailabilityText }}
+              </span>
+              <div class="flex items-center gap-2">
             <button
               v-if="running"
               :disabled="!canInterrupt"
@@ -2501,6 +2945,8 @@ onUnmounted(() => {
             ></span>
               {{ running ? 'Steer' : 'Run' }}
             </button>
+              </div>
+            </div>
           </div>
         </div>
       </div>

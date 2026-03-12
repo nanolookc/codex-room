@@ -131,9 +131,6 @@ export class AppServerSession {
         name: 'codex_room',
         title: 'Codex Room',
         version: '0.1.0'
-      },
-      capabilities: {
-        experimentalApi: true
       }
     });
     session.notify('initialized', {});
@@ -215,7 +212,7 @@ export class AppServerSession {
     if (!this.proc.killed) {
       this.proc.kill('SIGTERM');
       setTimeout(() => {
-        if (!this.proc.killed) this.proc.kill('SIGKILL');
+        if (this.proc.exitCode === null) this.proc.kill('SIGKILL');
       }, 800);
     }
   }
@@ -260,4 +257,3 @@ export class AppServerSession {
     this.writeMessage(payload);
   }
 }
-
