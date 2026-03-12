@@ -95,53 +95,20 @@ function normalizeEditor(editor: EditorState | null | undefined, roomId: string)
     typeof editor?.updatedBy === 'string' && editor.updatedBy
       ? editor.updatedBy
       : 'system';
+  const now = Date.now();
+  const minCursorAt = Number.isFinite(now) ? now - EDITOR_CURSOR_TTL_MS : Number.NEGATIVE_INFINITY;
   const cursors = Array.isArray(editor?.cursors)
     ? editor.cursors
         .map((cursor) => normalizeCursorEntry(cursor, text.length))
+        .filter((cursor) => {
+          if (!cursor) return false;
+          const cursorAt = Date.parse(cursor.updatedAt);
+          return Number.isFinite(cursorAt) && cursorAt >= minCursorAt;
+        })
         .filter((cursor): cursor is EditorCursor => Boolean(cursor))
     : [];
 
   return { roomId, text, version, updatedAt, updatedBy, ...(cursors.length ? { cursors } : {}) };
-}
-
-export interface RoomThreadSummary {
-  id: string;
-  roomId: string;
-  preview?: string;
-  updatedAt?: number;
-  createdAt?: number;
-}
-
-function threadPreviewFromTimeline(timeline: TimelineEntry[]): string {
-  for (let i = timeline.length - 1; i >= 0; i--) {
-    const entry = timeline[i];
-    const meta = entry.meta;
-    if (meta?.kind === 'codex.completed' || meta?.kind === 'codex.failed') continue;
-
-    if (meta?.kind === 'user.message') {
-      const text = entry.text.trim();
-      if (text) return text.slice(0, 200);
-      continue;
-    }
-
-    if (meta?.kind === 'codex.started') {
-      const text = entry.text.startsWith('Started:')
-        ? entry.text.slice('Started:'.length).trim()
-        : entry.text.trim();
-      if (text) return text.slice(0, 200);
-      continue;
-    }
-
-    if (meta?.kind === 'codex.item') {
-      const text = entry.text
-        .replace(/^Item:\s*[^\n]+\n?/, '')
-        .trim();
-      if (text) return text.slice(0, 200);
-    }
-  }
-
-  const fallback = timeline.at(-1)?.text?.trim() ?? '';
-  return fallback.slice(0, 200);
 }
 
 function collectTextParts(value: unknown): string[] {
@@ -693,38 +660,6 @@ export class RoomStore {
         hasThreadId: Boolean(room.threadId),
         preview: room.timeline.at(-1)?.text?.slice(0, 140)
       }));
-  }
-
-  listRoomThreads(limit = 40): RoomThreadSummary[] {
-    const byThreadId = new Map<string, RoomThreadSummary>();
-
-    for (const room of this.rooms.values()) {
-      if (room.workspace !== this.workspace) continue;
-      const threadId = room.threadId?.trim();
-      if (!threadId) continue;
-
-      const updatedMs = Date.parse(room.updatedAt);
-      const firstTimelineAt = room.timeline[0]?.at;
-      const createdMs = firstTimelineAt ? Date.parse(firstTimelineAt) : Number.NaN;
-      const preview = threadPreviewFromTimeline(room.timeline) || undefined;
-
-      const summary: RoomThreadSummary = {
-        id: threadId,
-        roomId: room.roomId,
-        preview,
-        updatedAt: Number.isNaN(updatedMs) ? undefined : Math.floor(updatedMs / 1000),
-        createdAt: Number.isNaN(createdMs) ? undefined : Math.floor(createdMs / 1000)
-      };
-
-      const prev = byThreadId.get(threadId);
-      if (!prev || (summary.updatedAt ?? 0) > (prev.updatedAt ?? 0)) {
-        byThreadId.set(threadId, summary);
-      }
-    }
-
-    return [...byThreadId.values()]
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-      .slice(0, limit);
   }
 
   setThreadId(roomId: string, threadId: string) {

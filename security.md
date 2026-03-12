@@ -22,6 +22,10 @@ Immediate direction:
 - require scope checks for every allowed method that accepts `threadId`-like params;
 - reject unsupported methods by default instead of forwarding them upstream.
 
+Status update:
+- browser RPC proxy now runs on an explicit allowlist;
+- `/api/codex/threads` no longer falls back to `roomStore` when `thread/list` fails, so thread discovery stays tied to the stable app-server source of truth.
+
 ### 2. Approval safety was effectively disabled
 
 The backend auto-accepted `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`.

@@ -8,6 +8,15 @@ import type {
   TimelineEntry
 } from '@codex-room/shared';
 import DiffPatch from './components/DiffPatch.vue';
+import {
+  approvalDecisionOptionsFromValue,
+  buildGrantedPermissions,
+  extractRequestedWriteRoots,
+  formatEffortLabel,
+  parseModelEffortOptions,
+  threadStatusTypeFromValue,
+  type ApprovalDecision
+} from './lib/codexProtocol';
 
 const markdown = new MarkdownIt({
   html: false,
@@ -70,6 +79,7 @@ type CodexThreadSummary = {
   createdAt?: number;
   model?: string;
   cwd?: string;
+  source?: string;
 };
 const codexThreads = ref<CodexThreadSummary[]>([]);
 const editorEl = ref<HTMLTextAreaElement | null>(null);
@@ -148,16 +158,42 @@ type ModelOption = {
   effortOptions?: EffortOption[];
   defaultEffort?: string;
 };
+type PendingApproval = {
+  requestId: number | string;
+  method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval';
+  itemId: string | null;
+  title: string;
+  reason: string;
+  command?: string;
+  patch?: string;
+  files?: string[];
+  decisions: ApprovalDecision[];
+};
+type PermissionPromptOutcome =
+  | { action: 'grant'; scope: 'turn' | 'session'; grantedWriteRoots: string[] }
+  | { action: 'decline' }
+  | 'cleared';
+type PendingPermissionsRequest = {
+  requestId: number | string;
+  reason: string;
+  permissions: Record<string, unknown>;
+  requestedWriteRoots: string[];
+  selectedWriteRoots: string[];
+};
 type AccessMode = 'full-access' | 'need-approve';
+type ApprovalPromptOutcome = ApprovalDecision | 'cleared';
 const usageByTurnAt = ref(new Map<string, UsageDisplay>());
 const latestUsageFromEvent = ref<UsageDisplay | null>(null);
 const currentThreadId = ref<string | null>(null);
 const debugCopyStatus = ref<'idle' | 'copied' | 'error'>('idle');
 const apiError = ref<string | null>(null);
+const conflictedEditorDraft = ref<string | null>(null);
 const modelOptions = ref<ModelOption[]>([]);
 const selectedModel = ref('default');
 const selectedEffort = ref('');
 const accessMode = ref<AccessMode>('full-access');
+const pendingApproval = ref<PendingApproval | null>(null);
+const pendingPermissionsRequest = ref<PendingPermissionsRequest | null>(null);
 const openMenu = ref<'model' | 'effort' | 'access' | null>(null);
 const modelMenuEl = ref<HTMLElement | null>(null);
 const effortMenuEl = ref<HTMLElement | null>(null);
@@ -174,6 +210,8 @@ const liveCodexItemState = new Map<string, Record<string, unknown>>();
 const latestTurnDiffPatchByTurnId = new Map<string, string>();
 const recentDebugEvents: DebugEventSnapshot[] = [];
 const MAX_DEBUG_EVENTS = 300;
+let pendingApprovalResolver: ((decision: ApprovalPromptOutcome) => void) | null = null;
+let pendingPermissionsResolver: ((outcome: PermissionPromptOutcome) => void) | null = null;
 
 const hasPrompt = computed(() => editorText.value.trim().length > 0);
 const canRun = computed(() => hasPrompt.value && !running.value);
@@ -216,12 +254,88 @@ watch(
   { immediate: true }
 );
 
-function formatEffortLabel(value: string): string {
-  return value
-    .split(/[-_\s]+/u)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
+function syncComposerDefaults(model?: string, reasoningEffort?: string) {
+  if (typeof model === 'string' && model.trim()) {
+    selectedModel.value = model.trim();
+  }
+  if (typeof reasoningEffort === 'string' && reasoningEffort.trim()) {
+    selectedEffort.value = reasoningEffort.trim();
+  }
+}
+
+function approvalDecisionLabel(decision: ApprovalDecision): string {
+  switch (decision) {
+    case 'accept':
+      return 'Approve Once';
+    case 'acceptForSession':
+      return 'Approve Session';
+    case 'decline':
+      return 'Decline';
+    case 'cancel':
+      return 'Cancel';
+  }
+}
+
+function commandTextFromApprovalParams(params: any): string {
+  if (typeof params?.command === 'string' && params.command.trim()) return params.command.trim();
+  if (Array.isArray(params?.commandActions)) {
+    const commands = params.commandActions
+      .map((entry: any) => (typeof entry?.command === 'string' ? entry.command.trim() : ''))
+      .filter(Boolean);
+    if (commands.length > 0) return commands.join('\n');
+  }
+  return '';
+}
+
+function fileLinesFromApprovalItem(item: Record<string, unknown> | null): string[] {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  return changes
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return '';
+      const obj = entry as Record<string, unknown>;
+      const kind = typeof obj.kind === 'string' ? obj.kind : '';
+      const path = typeof obj.path === 'string' ? obj.path : '';
+      return [kind, path].filter(Boolean).join(': ');
+    })
+    .filter(Boolean);
+}
+
+function openApprovalPrompt(request: PendingApproval): Promise<ApprovalPromptOutcome> {
+  if (pendingApprovalResolver) {
+    pendingApprovalResolver('cleared');
+    pendingApprovalResolver = null;
+  }
+  pendingApproval.value = request;
+  return new Promise((resolve) => {
+    pendingApprovalResolver = (decision) => {
+      pendingApproval.value = null;
+      pendingApprovalResolver = null;
+      resolve(decision);
+    };
+  });
+}
+
+function resolvePendingApproval(decision: ApprovalPromptOutcome) {
+  pendingApprovalResolver?.(decision);
+}
+
+function openPermissionsPrompt(request: PendingPermissionsRequest): Promise<PermissionPromptOutcome> {
+  if (pendingPermissionsResolver) {
+    pendingPermissionsResolver('cleared');
+    pendingPermissionsResolver = null;
+  }
+  pendingPermissionsRequest.value = request;
+  return new Promise((resolve) => {
+    pendingPermissionsResolver = (outcome) => {
+      pendingPermissionsRequest.value = null;
+      pendingPermissionsResolver = null;
+      resolve(outcome);
+    };
+  });
+}
+
+function resolvePendingPermissions(outcome: PermissionPromptOutcome) {
+  pendingPermissionsResolver?.(outcome);
 }
 
 function randomPick<T>(items: T[]): T {
@@ -247,6 +361,10 @@ function resetCodexRuntimeState() {
   liveCodexItemState.clear();
   latestTurnDiffPatchByTurnId.clear();
   recentDebugEvents.length = 0;
+  pendingApproval.value = null;
+  pendingApprovalResolver = null;
+  pendingPermissionsRequest.value = null;
+  pendingPermissionsResolver = null;
 }
 
 function compactDebugValue(value: unknown, depth = 0): unknown {
@@ -582,6 +700,16 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
   if (itemType === 'command_execution') {
     const parts: string[] = [];
     if (item.command !== undefined) parts.push(`command: ${typeof item.command === 'string' ? item.command : safeJson(item.command)}`);
+    if (typeof item.status === 'string' && item.status.trim()) parts.push(`status: ${item.status.trim()}`);
+    if (item.approval && typeof item.approval === 'object') {
+      const approval = item.approval as Record<string, unknown>;
+      if (typeof approval.decision === 'string' && approval.decision.trim()) {
+        parts.push(`approval: ${approval.decision.trim()}`);
+      }
+      if (typeof approval.reason === 'string' && approval.reason.trim()) {
+        parts.push(`reason: ${approval.reason.trim()}`);
+      }
+    }
     if (item.exitCode !== undefined || item.exit_code !== undefined) parts.push(`exit: ${String(item.exitCode ?? item.exit_code)}`);
     const output = item.aggregatedOutput ?? item.aggregated_output ?? item.output;
     if (typeof output === 'string' && output.trim()) parts.push(`output:\n${output.trim()}`);
@@ -602,6 +730,10 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
       })
       .filter(Boolean);
     const parts = [
+      typeof item.status === 'string' && item.status.trim() ? `status: ${item.status.trim()}` : '',
+      item.approval && typeof item.approval === 'object' && typeof (item.approval as Record<string, unknown>).decision === 'string'
+        ? `approval: ${String((item.approval as Record<string, unknown>).decision)}`
+        : '',
       fileLines.length ? `files:\n${fileLines.map((l) => `- ${l}`).join('\n')}` : '',
       typeof item.outputDelta === 'string' && item.outputDelta.trim() ? item.outputDelta.trim() : ''
     ].filter(Boolean);
@@ -615,6 +747,13 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
 
   if (itemType === 'mcp_tool_call' || itemType === 'collab_tool_call') {
     return safeJson(item);
+  }
+
+  if (itemType === 'model_reroute') {
+    const fromModel = typeof item.fromModel === 'string' ? item.fromModel : 'unknown';
+    const toModel = typeof item.toModel === 'string' ? item.toModel : 'unknown';
+    const reason = typeof item.reason === 'string' ? item.reason.trim() : '';
+    return [`from: ${fromModel}`, `to: ${toModel}`, reason ? `reason: ${reason}` : ''].filter(Boolean).join('\n');
   }
 
   if (itemType === 'web_search' || itemType === 'image_view') {
@@ -1372,6 +1511,7 @@ function itemLabel(item: LogEntry): string {
   const meta = normalizeMeta(item);
   const map: Record<string, string> = {
     reasoning: 'think',
+    model_reroute: 'model',
     command_execution: 'cmd',
     file_change: 'file',
     turn_diff: 'turn diff',
@@ -1485,6 +1625,7 @@ function itemCommandExecution(item: LogEntry): ParsedCommandExecution | null {
 function itemTextClass(item: LogEntry): string {
   const meta = normalizeMeta(item);
   if (meta.itemType === 'reasoning') return 'text-neutral-500 italic';
+  if (meta.itemType === 'model_reroute') return 'text-amber-700';
   if (meta.itemType === 'command_execution') return 'font-mono text-neutral-700';
   if (meta.itemType === 'file_change') return 'font-mono text-teal-700';
   if (meta.itemType === 'turn_diff') return 'font-mono text-sky-700';
@@ -1537,6 +1678,14 @@ function toggleMenu(menu: 'model' | 'effort' | 'access') {
 
 function closeMenus() {
   openMenu.value = null;
+}
+
+function restoreConflictedDraft() {
+  if (typeof conflictedEditorDraft.value !== 'string') return;
+  applyingRemoteEditorUpdate = true;
+  editorText.value = conflictedEditorDraft.value;
+  conflictedEditorDraft.value = null;
+  apiError.value = null;
 }
 
 function selectModelOption(optionId: string) {
@@ -1718,24 +1867,27 @@ async function collectToolRequestUserInputResponse(params: any) {
   return { answers };
 }
 
-function summarizePermissionsRequest(params: any): string {
-  const reason = typeof params?.reason === 'string' ? params.reason.trim() : '';
-  const permissions =
-    params?.permissions && typeof params.permissions === 'object'
-      ? JSON.stringify(params.permissions, null, 2)
-      : '{}';
-  return [reason, permissions].filter(Boolean).join('\n\n').trim();
-}
-
 async function respondToPermissionsRequest(requestId: number | string, params: any) {
   const requestedPermissions =
     params?.permissions && typeof params.permissions === 'object'
       ? cloneJsonValue(params.permissions)
       : {};
-  const accepted =
+  const requestedWriteRoots = extractRequestedWriteRoots(requestedPermissions);
+  const outcome =
     accessMode.value === 'full-access'
-      ? true
-      : window.confirm(`Grant requested permissions?\n\n${summarizePermissionsRequest(params)}`);
+      ? ({ action: 'grant', scope: 'session', grantedWriteRoots: requestedWriteRoots } satisfies PermissionPromptOutcome)
+      : await openPermissionsPrompt({
+          requestId,
+          reason: typeof params?.reason === 'string' ? params.reason.trim() : '',
+          permissions: requestedPermissions,
+          requestedWriteRoots,
+          selectedWriteRoots: [...requestedWriteRoots]
+        });
+  if (outcome === 'cleared') return;
+  const accepted = outcome.action === 'grant';
+  const grantedPermissions = accepted
+    ? buildGrantedPermissions(requestedPermissions, outcome.grantedWriteRoots)
+    : {};
 
   pushEntry({
     side: 'right',
@@ -1750,8 +1902,8 @@ async function respondToPermissionsRequest(requestId: number | string, params: a
   await codexRespond(requestId, {
     result: accepted
       ? {
-          scope: accessMode.value === 'full-access' ? 'session' : 'turn',
-          permissions: requestedPermissions
+          scope: accessMode.value === 'full-access' ? 'session' : outcome.scope,
+          permissions: grantedPermissions
         }
       : {
           scope: 'turn',
@@ -1839,6 +1991,13 @@ function readFinalResponseFromTurn(turn: any): string {
 function replayTurnsFromThreadRead(thread: any) {
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
   for (const turn of turns) {
+    const turnModel = typeof turn?.model === 'string' ? turn.model : undefined;
+    const turnEffort =
+      typeof turn?.effort === 'string'
+        ? turn.effort
+        : typeof turn?.reasoningEffort === 'string'
+          ? turn.reasoningEffort
+          : undefined;
     const turnId = typeof turn?.id === 'string' ? turn.id : null;
     const baseAt =
       typeof turn?.createdAt === 'string'
@@ -1849,13 +2008,10 @@ function replayTurnsFromThreadRead(thread: any) {
     appendCodexTurnStarted(
       readPromptFromTurn(turn) || '(resumed turn)',
       baseAt,
-      typeof turn?.model === 'string' ? turn.model : undefined,
-      typeof turn?.effort === 'string'
-        ? turn.effort
-        : typeof turn?.reasoningEffort === 'string'
-          ? turn.reasoningEffort
-          : undefined
+      turnModel,
+      turnEffort
     );
+    syncComposerDefaults(turnModel, turnEffort);
     const items = Array.isArray(turn?.items) ? turn.items : [];
     for (const item of items) {
       if (!item || typeof item !== 'object') continue;
@@ -1902,6 +2058,10 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const msg = params?.msg ?? {};
     const rawType = typeof msg?.type === 'string' ? msg.type : '';
 
+    // Compatibility fallback: stable clients should rely on thread/tokenUsage/updated.
+    // Keep legacy token_count support because upstream/raw payloads may still surface it
+    // during reconnects or mixed-version environments, and future experimental opt-ins may
+    // temporarily expose the raw family again.
     if (rawType === 'token_count') {
       if (msg?.info && typeof msg.info === 'object') {
         latestThreadUsageRaw = {
@@ -1935,6 +2095,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   }
 
   if (method === 'thread/closed') {
+    currentThreadId.value = null;
     activeCodexTurnId = null;
     latestTurnDiffPatchByTurnId.clear();
     stopWorkingTimer(at);
@@ -1942,8 +2103,9 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   }
 
   if (method === 'thread/status/changed') {
-    const status = typeof params?.status === 'string' ? params.status : '';
+    const status = threadStatusTypeFromValue(params?.status);
     if (status === 'notLoaded') {
+      currentThreadId.value = null;
       activeCodexTurnId = null;
       latestTurnDiffPatchByTurnId.clear();
       stopWorkingTimer(at);
@@ -1959,9 +2121,17 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
 
   if (method === 'turn/started') {
     const turn = params?.turn ?? {};
+    const turnModel = typeof turn?.model === 'string' ? turn.model : undefined;
+    const turnEffort =
+      typeof turn?.effort === 'string'
+        ? turn.effort
+        : typeof turn?.reasoningEffort === 'string'
+          ? turn.reasoningEffort
+          : undefined;
     if (typeof turn?.id === 'string') activeCodexTurnId = turn.id;
     latestThreadUsageRaw = null;
     latestUsageFromEvent.value = null;
+    syncComposerDefaults(turnModel, turnEffort);
     if (!running.value) {
       const lastUserEntry = [...logEntries.value]
         .reverse()
@@ -1969,12 +2139,8 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       appendCodexTurnStarted(
         lastUserEntry?.text ?? '(running turn)',
         at,
-        typeof turn?.model === 'string' ? turn.model : undefined,
-        typeof turn?.effort === 'string'
-          ? turn.effort
-          : typeof turn?.reasoningEffort === 'string'
-            ? turn.reasoningEffort
-            : undefined
+        turnModel,
+        turnEffort
       );
     }
     return;
@@ -2079,7 +2245,15 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   if (method === 'turn/diff/updated') {
     ensureLiveTurnStarted();
     const turnId = typeof params?.turnId === 'string' ? params.turnId : null;
-    const patch = typeof params?.diff === 'string' ? params.diff : '';
+    // Stable docs describe { diff }, but some mixed-version servers still expose
+    // diffPreview/diffLength on this notification. Prefer the documented field and
+    // keep the preview fallback so turn-level diff UI does not disappear mid-upgrade.
+    const patch =
+      typeof params?.diff === 'string'
+        ? params.diff
+        : typeof params?.diffPreview === 'string'
+          ? params.diffPreview
+          : '';
     if (turnId && patch.trim()) latestTurnDiffPatchByTurnId.set(turnId, patch);
     upsertTurnDiffEntryForTurn(turnId, patch, at);
     return;
@@ -2102,9 +2276,10 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     ensureLiveTurnStarted();
     appendCodexItemTimeline(
       {
-        type: 'reasoning',
-        summary: { text: `model rerouted: ${params?.fromModel ?? 'unknown'} -> ${params?.toModel ?? 'unknown'}` },
-        content: { text: typeof params?.reason === 'string' ? params.reason : '' }
+        type: 'model_reroute',
+        fromModel: typeof params?.fromModel === 'string' ? params.fromModel : 'unknown',
+        toModel: typeof params?.toModel === 'string' ? params.toModel : 'unknown',
+        reason: typeof params?.reason === 'string' ? params.reason : ''
       },
       at
     );
@@ -2145,35 +2320,40 @@ async function handleCodexServerRequest(message: CodexRpcMessage) {
   const params = (message.params ?? {}) as any;
 
   if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    const itemId = codexItemIdFrom(params);
+    const pendingItem = itemId ? liveCodexItemState.get(itemId) ?? null : null;
     const decision =
       accessMode.value === 'full-access'
         ? 'acceptForSession'
-        : window.confirm(
-            method === 'item/fileChange/requestApproval'
-              ? `Approve file change?\n\n${typeof params?.reason === 'string' ? params.reason : ''}`.trim()
-              : `Approve command?\n\n${
-                  typeof params?.command === 'string'
-                    ? params.command
-                    : Array.isArray(params?.commandActions)
-                      ? params.commandActions
-                          .map((entry: any) => entry?.command)
-                          .filter((entry: unknown) => typeof entry === 'string')
-                          .join('\n')
-                      : ''
-                }\n${typeof params?.reason === 'string' ? `\n${params.reason}` : ''}`.trim()
-          )
-          ? 'acceptForSession'
-          : 'decline';
+        : await openApprovalPrompt({
+            requestId,
+            method,
+            itemId,
+            title: method === 'item/fileChange/requestApproval' ? 'Approve File Change' : 'Approve Command',
+            reason: typeof params?.reason === 'string' ? params.reason.trim() : '',
+            command: method === 'item/commandExecution/requestApproval' ? commandTextFromApprovalParams(params) : undefined,
+            patch:
+              method === 'item/fileChange/requestApproval' && pendingItem
+                ? extractItemRawPatch(pendingItem, 'file_change') ?? undefined
+                : undefined,
+            files:
+              method === 'item/fileChange/requestApproval'
+                ? fileLinesFromApprovalItem(pendingItem)
+                : undefined,
+            decisions: approvalDecisionOptionsFromValue(params?.availableDecisions)
+          });
+    if (decision === 'cleared') return;
 
     appendCodexItemTimeline(
       {
         type: method === 'item/fileChange/requestApproval' ? 'fileChange' : 'commandExecution',
-        id: codexItemIdFrom(params) ?? undefined,
+        id: itemId ?? undefined,
         status: 'awaiting_approval',
         approval: {
           decision,
-          source: accessMode.value === 'full-access' ? 'frontend-auto' : 'frontend-confirm',
-          method
+          source: accessMode.value === 'full-access' ? 'frontend-auto' : 'frontend-inline',
+          method,
+          reason: typeof params?.reason === 'string' ? params.reason : undefined
         }
       },
       new Date().toISOString()
@@ -2328,30 +2508,10 @@ async function loadModels() {
       .map((entry: any) => {
         const id = typeof entry?.id === 'string' ? entry.id : '';
         if (!id) return null;
-        const effortEntries = Array.isArray(entry?.supportedReasoningEfforts)
-          ? entry.supportedReasoningEfforts
-          : Array.isArray(entry?.reasoningEffort)
-            ? entry.reasoningEffort
-            : [];
-        const effortOptions = effortEntries
-              .map((effortEntry: any) => {
-                const effortId =
-                  typeof effortEntry?.reasoningEffort === 'string'
-                    ? effortEntry.reasoningEffort
-                    : typeof effortEntry?.effort === 'string'
-                      ? effortEntry.effort
-                      : '';
-                if (!effortId) return null;
-                return {
-                  id: effortId,
-                  label: formatEffortLabel(effortId),
-                  description:
-                    typeof effortEntry?.description === 'string' && effortEntry.description.trim()
-                      ? effortEntry.description.trim()
-                      : undefined
-                } satisfies EffortOption;
-              })
-              .filter((effortEntry: EffortOption | null): effortEntry is EffortOption => Boolean(effortEntry));
+        // Prefer the current stable supportedReasoningEfforts payload.
+        // Keep the older reasoningEffort shape as a compatibility shim so future
+        // experimental or mixed-version servers do not blank the picker.
+        const effortOptions = parseModelEffortOptions(entry) as EffortOption[];
         return {
           id,
           label:
@@ -2404,6 +2564,7 @@ async function switchRoom(nextRoomId: string) {
     roomId.value = cleanRoomId;
     logEntries.value = [];
     running.value = false;
+    conflictedEditorDraft.value = null;
     stopWorkingTimer();
   }
 
@@ -2546,6 +2707,17 @@ function connectEvents() {
                   pushDebugEvent(event.type, event.at, event.message);
                   void handleCodexServerRequest(event.message);
                   break;
+                case 'codex.rpc.serverRequest.resolved':
+                  if (pendingApproval.value && String(pendingApproval.value.requestId) === String(event.requestId)) {
+                    resolvePendingApproval('cleared');
+                  }
+                  if (
+                    pendingPermissionsRequest.value &&
+                    String(pendingPermissionsRequest.value.requestId) === String(event.requestId)
+                  ) {
+                    resolvePendingPermissions('cleared');
+                  }
+                  break;
                 case 'system.connected':
                   apiError.value = null;
                   break;
@@ -2593,12 +2765,19 @@ async function syncEditor() {
       const data = (await response.json().catch(() => ({}))) as { editor?: any; error?: string };
       const serverEditor = data.editor;
       if (serverEditor && typeof serverEditor.text === 'string') {
+        if (editorText.value && editorText.value !== serverEditor.text) {
+          conflictedEditorDraft.value = editorText.value;
+        }
         applyingRemoteEditorUpdate = true;
         editorText.value = serverEditor.text;
         editorVersion.value =
           typeof serverEditor.version === 'number' ? serverEditor.version : editorVersion.value;
         editorCursors.value = Array.isArray(serverEditor.cursors) ? serverEditor.cursors : editorCursors.value;
-        apiError.value = data.error ?? 'Prompt was changed by another collaborator. Your local draft was refreshed.';
+        apiError.value =
+          data.error ??
+          (conflictedEditorDraft.value
+            ? 'Prompt was changed by another collaborator. Server text was loaded; your previous draft can be restored.'
+            : 'Prompt was changed by another collaborator. Your local draft was refreshed.');
       }
       return;
     }
@@ -2833,8 +3012,121 @@ onUnmounted(() => {
       v-if="apiError"
       class="shrink-0 border-b border-amber-200 bg-amber-50 px-5 py-2 text-[12px] text-amber-800"
     >
-      {{ apiError }}
+      <div class="flex items-center justify-between gap-3">
+        <span>{{ apiError }}</span>
+        <button
+          v-if="conflictedEditorDraft"
+          type="button"
+          class="shrink-0 rounded-md border border-amber-300 px-2 py-1 text-[11px] font-medium text-amber-900 hover:bg-amber-100"
+          @click="restoreConflictedDraft"
+        >
+          Restore draft
+        </button>
+      </div>
     </div>
+
+    <section
+      v-if="pendingApproval"
+      class="shrink-0 border-b border-orange-200 bg-orange-50 px-5 py-3"
+    >
+      <div class="rounded-xl border border-orange-200 bg-white p-3">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <p class="text-[11px] font-semibold uppercase tracking-wide text-orange-500">Approval Needed</p>
+            <p class="mt-1 text-sm font-medium text-neutral-900">{{ pendingApproval.title }}</p>
+            <p v-if="pendingApproval.reason" class="mt-1 whitespace-pre-wrap text-[12px] text-neutral-600">{{ pendingApproval.reason }}</p>
+          </div>
+        </div>
+
+        <div v-if="pendingApproval.command" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
+          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">command</div>
+          <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ pendingApproval.command }}</pre>
+        </div>
+
+        <div v-if="pendingApproval.files && pendingApproval.files.length" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
+          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">files</div>
+          <div class="px-2 py-1.5 text-[11px] leading-relaxed text-neutral-700">
+            <div v-for="file in pendingApproval.files" :key="file">{{ file }}</div>
+          </div>
+        </div>
+
+        <div v-if="pendingApproval.patch" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
+          <DiffPatch :patch="pendingApproval.patch" />
+        </div>
+
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button
+            v-for="decision in pendingApproval.decisions"
+            :key="decision"
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
+            @click="resolvePendingApproval(decision)"
+          >
+            {{ approvalDecisionLabel(decision) }}
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section
+      v-if="pendingPermissionsRequest"
+      class="shrink-0 border-b border-teal-200 bg-teal-50 px-5 py-3"
+    >
+      <div class="rounded-xl border border-teal-200 bg-white p-3">
+        <p class="text-[11px] font-semibold uppercase tracking-wide text-teal-600">Permissions Request</p>
+        <p class="mt-1 text-sm font-medium text-neutral-900">
+          {{ pendingPermissionsRequest.reason || 'Codex requests additional permissions for this turn.' }}
+        </p>
+
+        <div v-if="pendingPermissionsRequest.requestedWriteRoots.length" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
+          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">write roots</div>
+          <div class="space-y-2 px-2 py-2">
+            <label
+              v-for="root in pendingPermissionsRequest.requestedWriteRoots"
+              :key="root"
+              class="flex items-start gap-2 text-[12px] text-neutral-700"
+            >
+              <input
+                v-model="pendingPermissionsRequest.selectedWriteRoots"
+                type="checkbox"
+                :value="root"
+                class="mt-0.5"
+              >
+              <span class="break-all">{{ root }}</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
+          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">requested permissions</div>
+          <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ JSON.stringify(pendingPermissionsRequest.permissions, null, 2) }}</pre>
+        </div>
+
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
+            @click="resolvePendingPermissions({ action: 'grant', scope: 'turn', grantedWriteRoots: [...pendingPermissionsRequest.selectedWriteRoots] })"
+          >
+            Grant For Turn
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
+            @click="resolvePendingPermissions({ action: 'grant', scope: 'session', grantedWriteRoots: [...pendingPermissionsRequest.selectedWriteRoots] })"
+          >
+            Grant For Session
+          </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-white px-3 py-1.5 text-xs font-medium text-rose-700 transition-colors hover:bg-rose-50"
+            @click="resolvePendingPermissions({ action: 'decline' })"
+          >
+            Decline
+          </button>
+        </div>
+      </div>
+    </section>
 
     <section v-if="view === 'home'" class="flex-1 overflow-y-auto">
       <div class="px-5 py-5 space-y-3">
@@ -2859,7 +3151,15 @@ onUnmounted(() => {
           >
             <span class="min-w-0">
               <span class="block truncate text-[13px] text-neutral-800">{{ thread.preview || thread.id }}</span>
-              <span class="block truncate text-[11px] text-neutral-400">{{ thread.id }}</span>
+              <span class="flex items-center gap-2 text-[11px] text-neutral-400">
+                <span class="truncate">{{ thread.id }}</span>
+                <span
+                  v-if="thread.source"
+                  class="shrink-0 rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 uppercase tracking-wide text-[10px] text-neutral-500"
+                >
+                  {{ thread.source }}
+                </span>
+              </span>
             </span>
             <span class="ml-3 shrink-0 text-[11px] text-neutral-400">
               {{ formatThreadTime(thread.updatedAt ?? thread.createdAt) }}

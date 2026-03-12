@@ -19,6 +19,7 @@
 ## Roadmap
 
 - Finish stable `app-server` alignment first; experimental features must not weaken the stable chat flow.
+- Keep any compatibility code that intentionally preserves a path toward future experimental API adoption, but mark it clearly in code comments and do not let it override the stable protocol path.
 - After stable parity, evaluate a guarded opt-in for `persistExtendedHistory` to improve replay and reconnect hydration.
 - After stable parity, evaluate `tool/requestUserInput` UX and richer approval/request flows only where they match documented server-request contracts.
 - Keep `dynamicTools`, `thread/realtime/*`, plugins, and remote skills out of the main chat path until there is a clear product need and explicit protocol coverage.

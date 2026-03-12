@@ -60,6 +60,7 @@ type CodexThreadSummary = {
   createdAt?: number;
   model?: string;
   cwd?: string;
+  source?: string;
 };
 
 async function listCodexThreads(limit: number): Promise<CodexThreadSummary[]> {
@@ -97,25 +98,11 @@ async function listCodexThreads(limit: number): Promise<CodexThreadSummary[]> {
               : typeof entry?.modelProvider === 'string'
                 ? entry.modelProvider
                 : undefined,
-          cwd: typeof entry?.cwd === 'string' ? entry.cwd : undefined
+          cwd: typeof entry?.cwd === 'string' ? entry.cwd : undefined,
+          source: typeof entry?.source === 'string' ? entry.source : undefined
         };
       })
       .filter((entry): entry is CodexThreadSummary => Boolean(entry));
-  } finally {
-    session.close();
-  }
-}
-
-async function startCodexThread(): Promise<{ id: string }> {
-  const session = await AppServerSession.start(logger);
-  try {
-    const result = await session.request('thread/start', {
-      ...(CODEX_MODEL && CODEX_MODEL !== 'default' ? { model: CODEX_MODEL } : {}),
-      ...(WORKING_DIRECTORY ? { cwd: WORKING_DIRECTORY } : {})
-    });
-    const id = typeof result?.thread?.id === 'string' ? result.thread.id : null;
-    if (!id) throw new Error('Failed to create thread');
-    return { id };
   } finally {
     session.close();
   }
@@ -198,23 +185,8 @@ const app = new Elysia()
     const limit = Number(query.limit ?? 30);
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 30;
     logger.info('codex.threads.requested', { limit: safeLimit, scope: 'app_server' });
-    try {
-      const data = await listCodexThreads(safeLimit);
-      return { data };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.warn('codex.threads.list.failed.fallback_room_store', {
-        limit: safeLimit,
-        error: message
-      });
-      const data = roomStore.listRoomThreads(safeLimit);
-      return { data };
-    }
-  })
-  .post('/api/codex/threads/start', async () => {
-    const thread = await startCodexThread();
-    logger.info('codex.thread.created', { threadId: thread.id });
-    return { threadId: thread.id };
+    const data = await listCodexThreads(safeLimit);
+    return { data };
   })
   .get('/api/rooms', () => roomStore.listRooms())
   .post('/api/rooms/:roomId/thread', async ({ params, body }) => {
