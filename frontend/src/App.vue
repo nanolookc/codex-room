@@ -680,7 +680,8 @@ function appendCodexTurnTerminal(
     parsed?.contextAvailablePercent !== undefined
       ? `\nContext: ${parsed.contextAvailablePercent}% available`
       : '';
-  const finalText = (options.finalResponse ?? '').trim();
+  const finalTextRaw = (options.finalResponse ?? '').trim();
+  const finalText = turnAlreadyContainsAgentMessage(finalTextRaw) ? '' : finalTextRaw;
   pushEntry({
     side: 'right',
     label: 'codex',
@@ -842,17 +843,29 @@ function badgeClass(entry: LogEntry): string {
   return 'bg-neutral-100 text-neutral-500';
 }
 
+function itemRawBodyText(entry: LogEntry): string {
+  if (!entry.text.startsWith('Item:')) return entry.text;
+  return entry.text.split('\n').slice(1).join('\n').trim() || '(no details)';
+}
+
 function bodyText(entry: LogEntry): string {
   const meta = normalizeMeta(entry);
   if (meta.kind === 'codex.item' && entry.text.startsWith('Item:')) {
-    let body = entry.text.split('\n').slice(1).join('\n').trim() || '(no details)';
-    if (meta.itemType === 'file_change' && itemPatch(entry)) {
+    let body = itemRawBodyText(entry);
+    if (meta.itemType === 'file_change') {
       const diffMarker = '\ndiff:\n';
       const diffIndex = body.indexOf(diffMarker);
       if (diffIndex >= 0) {
         body = body.slice(0, diffIndex).trim();
       } else if (body.startsWith('diff:\n')) {
         body = '';
+      } else {
+        const diffHeaderIndex = body.indexOf('\ndiff --git');
+        if (diffHeaderIndex >= 0) {
+          body = body.slice(0, diffHeaderIndex).trim();
+        } else if (body.startsWith('diff --git')) {
+          body = '';
+        }
       }
     }
     return body || '(no details)';
@@ -872,6 +885,20 @@ function pushEntry(entry: Omit<LogEntry, 'id'>) {
       ...entry
     }
   ];
+}
+
+function turnAlreadyContainsAgentMessage(finalText: string): boolean {
+  const normalizedFinal = finalText.trim();
+  if (!normalizedFinal) return false;
+  for (let i = logEntries.value.length - 1; i >= 0; i -= 1) {
+    const entry = logEntries.value[i];
+    const kind = getEntryKind(entry);
+    if (kind === 'codex.started') break;
+    if (kind !== 'codex.item') continue;
+    if (normalizeMeta(entry).itemType !== 'agent_message') continue;
+    if (bodyText(entry).trim() === normalizedFinal) return true;
+  }
+  return false;
 }
 
 function getEntryKind(entry: LogEntry): NonNullable<LogEntry['meta']>['kind'] {
@@ -1332,7 +1359,7 @@ function itemPatch(item: LogEntry): string | null {
     return hasPatchFileHeaders(candidate) ? candidate : null;
   }
 
-  const text = bodyText(item);
+  const text = itemRawBodyText(item);
   const diffMarker = '\ndiff:\n';
   const diffMarkerIndex = text.indexOf(diffMarker);
   if (diffMarkerIndex >= 0) {
@@ -2302,9 +2329,12 @@ function connectEvents() {
 
               switch (event.type) {
                 case 'timeline.entry':
-                  addTimelineEntry(event.entry);
                   {
                     const kind = timelineEntryKind(event.entry);
+                    if (kind !== 'user.message') {
+                      break;
+                    }
+                    addTimelineEntry(event.entry);
                     if (kind === 'codex.started') {
                       running.value = true;
                       startWorkingTimer(event.entry.at);
