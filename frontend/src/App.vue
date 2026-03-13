@@ -1341,17 +1341,19 @@ async function openNewRoom() {
 }
 
 async function openCodexThread(threadId: string) {
-  const room = threadId.trim();
-  if (!room) return;
+  const selectedThreadId = threadId.trim();
+  if (!selectedThreadId) return;
+  const targetRoomId = sessionKeyFromQuery ? selectedThreadId : roomId.value;
+  if (!targetRoomId) return;
 
-  const response = await apiFetch(`/api/rooms/${encodeURIComponent(room)}/thread`, {
+  const response = await apiFetch(`/api/rooms/${encodeURIComponent(targetRoomId)}/thread`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ threadId: room })
+    body: JSON.stringify({ threadId: selectedThreadId })
   });
   if (!response.ok) throw new Error(`Failed to open Codex thread (${response.status})`);
 
-  await switchRoom(room);
+  await switchRoom(targetRoomId);
   await loadCodexThreads();
 }
 
