@@ -37,6 +37,7 @@ export type ModelOption = {
 export type PendingApproval = {
   requestId: number | string;
   method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval';
+  turnId: string | null;
   itemId: string | null;
   title: string;
   reason: string;
@@ -53,6 +54,7 @@ export type PermissionPromptOutcome =
 
 export type PendingPermissionsRequest = {
   requestId: number | string;
+  turnId: string | null;
   reason: string;
   permissions: Record<string, unknown>;
   requestedWriteRoots: string[];

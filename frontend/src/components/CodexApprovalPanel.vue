@@ -5,6 +5,7 @@ import type { ApprovalDecision } from '../lib/codexProtocol';
 
 defineProps<{
   pendingApproval: PendingApproval;
+  embedded?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -13,7 +14,10 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <section class="shrink-0 border-b border-orange-200 bg-orange-50 px-5 py-3">
+  <div
+    class="bg-orange-50"
+    :class="embedded ? 'border-t border-neutral-200 px-4 py-3' : 'shrink-0 border-b border-orange-200 px-5 py-3'"
+  >
     <div class="rounded-xl border border-orange-200 bg-white p-3">
       <div class="flex items-start justify-between gap-3">
         <div class="min-w-0">
@@ -51,5 +55,5 @@ const emit = defineEmits<{
         </button>
       </div>
     </div>
-  </section>
+  </div>
 </template>

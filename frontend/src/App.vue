@@ -15,12 +15,10 @@ import {
   readPromptFromTurn,
   usageFromEvent
 } from '@codex-room/shared';
-import CodexApprovalPanel from './components/CodexApprovalPanel.vue';
 import CodexComposer from './components/CodexComposer.vue';
 import CodexErrorBanner from './components/CodexErrorBanner.vue';
 import CodexHeaderBar from './components/CodexHeaderBar.vue';
 import CodexHomeView from './components/CodexHomeView.vue';
-import CodexPermissionsPanel from './components/CodexPermissionsPanel.vue';
 import CodexTimelineView from './components/CodexTimelineView.vue';
 import {
   approvalPolicyForMode,
@@ -630,9 +628,13 @@ async function respondToPermissionsRequest(requestId: number | string, params: a
   const requestedWriteRoots = extractRequestedWriteRoots(requestedPermissions);
   const outcome =
     accessMode.value === 'full-access'
-      ? ({ action: 'grant', scope: 'session', grantedWriteRoots: requestedWriteRoots } satisfies PermissionPromptOutcome)
+          ? ({ action: 'grant', scope: 'session', grantedWriteRoots: requestedWriteRoots } satisfies PermissionPromptOutcome)
       : await openPermissionsPrompt({
           requestId,
+          turnId:
+            typeof params?.turnId === 'string' && params.turnId.trim()
+              ? params.turnId
+              : activeCodexTurnId,
           reason: typeof params?.reason === 'string' ? params.reason.trim() : '',
           permissions: requestedPermissions,
           requestedWriteRoots,
@@ -669,7 +671,8 @@ async function respondToMcpServerElicitation(requestId: number | string, params:
     await codexRespond(requestId, {
       result: {
         action: accepted ? 'accept' : 'cancel',
-        content: null
+        content: null,
+        _meta: null
       }
     });
     return;
@@ -683,7 +686,7 @@ async function respondToMcpServerElicitation(requestId: number | string, params:
       );
       if (raw === null) {
         await codexRespond(requestId, {
-          result: { action: 'cancel', content: null }
+          result: { action: 'cancel', content: null, _meta: null }
         });
         return;
       }
@@ -691,7 +694,7 @@ async function respondToMcpServerElicitation(requestId: number | string, params:
       try {
         const content = trimmed ? JSON.parse(trimmed) : {};
         await codexRespond(requestId, {
-          result: { action: 'accept', content }
+          result: { action: 'accept', content, _meta: null }
         });
         return;
       } catch {
@@ -1076,6 +1079,10 @@ async function handleCodexServerRequest(message: CodexRpcMessage) {
         : await openApprovalPrompt({
             requestId,
             method,
+            turnId:
+              typeof params?.turnId === 'string' && params.turnId.trim()
+                ? params.turnId
+                : activeCodexTurnId,
             itemId,
             title: method === 'item/fileChange/requestApproval' ? 'Approve File Change' : 'Approve Command',
             reason: typeof params?.reason === 'string' ? params.reason.trim() : '',
@@ -1775,18 +1782,6 @@ onUnmounted(() => {
       @restore-draft="restoreConflictedDraft"
     />
 
-    <CodexApprovalPanel
-      v-if="pendingApproval"
-      :pending-approval="pendingApproval"
-      @resolve="resolvePendingApproval"
-    />
-
-    <CodexPermissionsPanel
-      v-if="pendingPermissionsRequest"
-      :pending-permissions-request="pendingPermissionsRequest"
-      @resolve="resolvePendingPermissions"
-    />
-
     <CodexHomeView
       v-if="view === 'home'"
       :codex-threads="codexThreads"
@@ -1805,6 +1800,10 @@ onUnmounted(() => {
         :latest-usage-from-event="latestUsageFromEvent"
         :latest-thread-usage-raw="latestThreadUsageRaw"
         :latest-turn-plan-text-by-turn-id="latestTurnPlanTextByTurnId"
+        :pending-approval="pendingApproval"
+        :pending-permissions-request="pendingPermissionsRequest"
+        @resolve-approval="resolvePendingApproval"
+        @resolve-permissions="resolvePendingPermissions"
       />
 
       <CodexComposer

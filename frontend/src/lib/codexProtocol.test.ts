@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   approvalDecisionOptionsFromValue,
+  approvalPolicyForMode,
   buildGrantedPermissions,
   extractRequestedWriteRoots,
   formatEffortLabel,
@@ -18,6 +19,11 @@ describe('codexProtocol', () => {
   test('parses approval decisions and falls back to safe defaults', () => {
     expect(approvalDecisionOptionsFromValue(['decline', 'accept'])).toEqual(['decline', 'accept']);
     expect(approvalDecisionOptionsFromValue(null)).toEqual(['accept', 'acceptForSession', 'decline']);
+  });
+
+  test('maps access modes to stable app-server approval policy values', () => {
+    expect(approvalPolicyForMode('full-access')).toBe('never');
+    expect(approvalPolicyForMode('need-approve')).toBe('untrusted');
   });
 
   test('formats reasoning effort labels', () => {

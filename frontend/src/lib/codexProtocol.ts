@@ -94,7 +94,11 @@ export function buildGrantedPermissions(requestedPermissions: unknown, grantedWr
 }
 
 export function approvalPolicyForMode(mode: AccessMode): string {
-  return mode === 'full-access' ? 'never' : 'unlessTrusted';
+  // Stable app-server v2 accepts string AskForApproval values:
+  // "untrusted" | "on-failure" | "on-request" | "never".
+  // Older docs/examples still mention the internal enum name "unlessTrusted",
+  // but the wire format uses "untrusted".
+  return mode === 'full-access' ? 'never' : 'untrusted';
 }
 
 export function sandboxModeForMode(mode: AccessMode): string {

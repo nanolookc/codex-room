@@ -1,6 +1,14 @@
 <script setup lang="ts">
+import CodexApprovalPanel from './CodexApprovalPanel.vue';
+import CodexPermissionsPanel from './CodexPermissionsPanel.vue';
 import CodexTechItem from './CodexTechItem.vue';
 import type { CodexLogEntry } from '../lib/codexTimeline';
+import type {
+  PendingApproval,
+  PendingPermissionsRequest,
+  PermissionPromptOutcome
+} from '../lib/codexAppUi';
+import type { ApprovalDecision } from '../lib/codexProtocol';
 
 type TurnGroup = {
   id: string;
@@ -31,6 +39,13 @@ const props = defineProps<{
   itemBody: (item: CodexLogEntry) => string;
   itemTextClass: (item: CodexLogEntry) => string;
   itemRowAlignClass: (item: CodexLogEntry) => string;
+  pendingApproval?: PendingApproval | null;
+  pendingPermissionsRequest?: PendingPermissionsRequest | null;
+}>();
+
+const emit = defineEmits<{
+  (e: 'resolve-approval', decision: ApprovalDecision): void;
+  (e: 'resolve-permissions', outcome: Exclude<PermissionPromptOutcome, 'cleared'>): void;
 }>();
 </script>
 
@@ -113,5 +128,19 @@ const props = defineProps<{
         </div>
       </template>
     </div>
+
+    <CodexApprovalPanel
+      v-if="pendingApproval"
+      embedded
+      :pending-approval="pendingApproval"
+      @resolve="emit('resolve-approval', $event)"
+    />
+
+    <CodexPermissionsPanel
+      v-if="pendingPermissionsRequest"
+      embedded
+      :pending-permissions-request="pendingPermissionsRequest"
+      @resolve="emit('resolve-permissions', $event)"
+    />
   </div>
 </template>

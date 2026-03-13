@@ -7,6 +7,7 @@ import type {
 
 const props = defineProps<{
   pendingPermissionsRequest: PendingPermissionsRequest;
+  embedded?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -25,7 +26,10 @@ watch(
 </script>
 
 <template>
-  <section class="shrink-0 border-b border-teal-200 bg-teal-50 px-5 py-3">
+  <div
+    class="bg-teal-50"
+    :class="embedded ? 'border-t border-neutral-200 px-4 py-3' : 'shrink-0 border-b border-teal-200 px-5 py-3'"
+  >
     <div class="rounded-xl border border-teal-200 bg-white p-3">
       <p class="text-[11px] font-semibold uppercase tracking-wide text-teal-600">Permissions Request</p>
       <p class="mt-1 text-sm font-medium text-neutral-900">
@@ -80,5 +84,5 @@ watch(
         </button>
       </div>
     </div>
-  </section>
+  </div>
 </template>

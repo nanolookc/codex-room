@@ -2,6 +2,11 @@
 import { computed, nextTick, ref, watch } from 'vue';
 import MarkdownIt from 'markdown-it';
 import type { CodexLogEntry as LogEntry, UsageDisplay } from '../lib/codexTimeline';
+import type {
+  PendingApproval,
+  PendingPermissionsRequest,
+  PermissionPromptOutcome
+} from '../lib/codexAppUi';
 import {
   bodyText,
   isHiddenItem,
@@ -9,6 +14,7 @@ import {
   parseCommandExecutionText
 } from '../lib/codexTimeline';
 import CodexTurnGroup from './CodexTurnGroup.vue';
+import type { ApprovalDecision } from '../lib/codexProtocol';
 
 type TurnGroup = {
   type: 'turn';
@@ -40,6 +46,13 @@ const props = defineProps<{
   latestUsageFromEvent: UsageDisplay | null;
   latestThreadUsageRaw: unknown;
   latestTurnPlanTextByTurnId: Map<string, { text: string; at: string }>;
+  pendingApproval: PendingApproval | null;
+  pendingPermissionsRequest: PendingPermissionsRequest | null;
+}>();
+
+const emit = defineEmits<{
+  (e: 'resolve-approval', decision: ApprovalDecision): void;
+  (e: 'resolve-permissions', outcome: Exclude<PermissionPromptOutcome, 'cleared'>): void;
 }>();
 
 const markdown = new MarkdownIt({
@@ -229,6 +242,24 @@ function turnGroupId(group: TurnGroup): string | null {
     if (typeof meta.turnId === 'string' && meta.turnId) return meta.turnId;
   }
   return null;
+}
+
+function pendingApprovalForGroup(group: TurnGroup): PendingApproval | null {
+  if (!props.pendingApproval) return null;
+  const groupId = turnGroupId(group);
+  if (props.pendingApproval.turnId && groupId) {
+    return props.pendingApproval.turnId === groupId ? props.pendingApproval : null;
+  }
+  return turnIsRunning(group) ? props.pendingApproval : null;
+}
+
+function pendingPermissionsForGroup(group: TurnGroup): PendingPermissionsRequest | null {
+  if (!props.pendingPermissionsRequest) return null;
+  const groupId = turnGroupId(group);
+  if (props.pendingPermissionsRequest.turnId && groupId) {
+    return props.pendingPermissionsRequest.turnId === groupId ? props.pendingPermissionsRequest : null;
+  }
+  return turnIsRunning(group) ? props.pendingPermissionsRequest : null;
 }
 
 function turnSegments(group: TurnGroup): TurnSegment[] {
@@ -470,6 +501,10 @@ defineExpose({
           :item-body="itemBody"
           :item-text-class="itemTextClass"
           :item-row-align-class="itemRowAlignClass"
+          :pending-approval="pendingApprovalForGroup(group)"
+          :pending-permissions-request="pendingPermissionsForGroup(group)"
+          @resolve-approval="emit('resolve-approval', $event)"
+          @resolve-permissions="emit('resolve-permissions', $event)"
         />
       </template>
     </div>

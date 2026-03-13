@@ -37,12 +37,13 @@ const emit = defineEmits<{
             <span class="block truncate text-[13px] text-neutral-800">{{ thread.preview || thread.id }}</span>
             <span class="flex items-center gap-2 text-[11px] text-neutral-400">
               <span class="truncate">{{ thread.id }}</span>
-              <span
+              <!-- Hide source until upstream app-server stops tagging app-server sessions as vscode. -->
+              <!-- <span
                 v-if="thread.source"
                 class="shrink-0 rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 uppercase tracking-wide text-[10px] text-neutral-500"
               >
                 {{ thread.source }}
-              </span>
+              </span> -->
             </span>
           </span>
           <span class="ml-3 shrink-0 text-[11px] text-neutral-400">
