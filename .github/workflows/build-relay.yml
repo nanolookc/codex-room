@@ -1,0 +1,82 @@
+name: build-relay-image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/nanolookc/codex-room-relay
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Checkout cluster repo
+        if: github.ref == 'refs/heads/main'
+        uses: actions/checkout@v4
+        with:
+          repository: nanolook-org/cluster
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.CLUSTER_REPO_TOKEN }}
+          path: cluster
+
+      - name: Update cluster values
+        if: github.ref == 'refs/heads/main'
+        run: |
+          python3 cluster/scripts/update-image-tags.py \
+            cluster/values/codex-room/values.yaml \
+            image.tag=sha-${GITHUB_SHA}
+
+      - name: Commit cluster values
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cd cluster
+          git checkout main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- values/codex-room/values.yaml; then
+            echo "No cluster changes to commit"
+            exit 0
+          fi
+
+          git add values/codex-room/values.yaml
+          git commit -m "chore(codex-room): deploy sha-${GITHUB_SHA}"
+          git pull --rebase origin main
+          git push origin HEAD:main

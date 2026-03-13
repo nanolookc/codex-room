@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-room-relay
+spec:
+  replicas: {{ .Values.replicas }}
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: { app: codex-room-relay }
+  template:
+    metadata:
+      labels: { app: codex-room-relay }
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: relay
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.containerPort }}
+          env:
+            - name: HOST
+              value: "{{ .Values.bindHost }}"
+            - name: PORT
+              value: "{{ .Values.containerPort }}"
+            - name: LOG_LEVEL
+              value: "{{ .Values.logLevel }}"
+            - name: RELAY_PUBLIC_BASE_URL
+              value: "{{ .Values.relay.publicBaseUrl }}"
+            - name: RELAY_COOKIE_SECURE
+              value: "{{ .Values.relay.cookieSecure }}"
+            - name: RELAY_SESSION_TTL_SECONDS
+              value: "{{ .Values.relay.sessionTtlSeconds }}"
+            - name: RELAY_MAX_VIEWERS
+              value: "{{ .Values.relay.maxViewers }}"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.containerPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.containerPort }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-room-relay
+spec:
+  selector: { app: codex-room-relay }
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.containerPort }}

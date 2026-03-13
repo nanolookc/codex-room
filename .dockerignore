@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+backend/node_modules
+frontend/node_modules
+relay/node_modules
+shared/node_modules
+frontend/dist
+backend/dist
+relay/dist
+coverage
+*.log
+.DS_Store

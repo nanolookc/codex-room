@@ -1,0 +1,31 @@
+domain: codex-room.hrebeni.uk
+
+replicas: 1
+
+imagePullSecrets: []
+
+image:
+  repository: ghcr.io/nanolookc/codex-room-relay
+  tag: "sha-DEV"
+
+containerPort: 3010
+
+service:
+  port: 80
+
+bindHost: 0.0.0.0
+logLevel: info
+
+relay:
+  publicBaseUrl: https://codex-room.hrebeni.uk
+  cookieSecure: true
+  sessionTtlSeconds: 86400
+  maxViewers: 4
+
+resources: {}
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations: {}
+  tlsSecretName: ""

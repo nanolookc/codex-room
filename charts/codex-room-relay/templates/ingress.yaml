@@ -1,0 +1,31 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codex-room-relay
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.domain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: codex-room-relay
+                port:
+                  number: {{ .Values.service.port }}
+  {{- if .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.domain | quote }}
+      secretName: {{ .Values.ingress.tlsSecretName | quote }}
+  {{- end }}
+{{- end }}
