@@ -12,7 +12,6 @@ COPY frontend/package.json frontend/tsconfig.json frontend/vite.config.ts ./fron
 COPY frontend/src ./frontend/src
 COPY frontend/index.html ./frontend/index.html
 COPY frontend/postcss.config.js ./frontend/postcss.config.js
-COPY frontend/public ./frontend/public
 
 RUN bun install --frozen-lockfile
 RUN bun run --cwd shared build
