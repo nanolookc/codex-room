@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronLeft, Clipboard, ClipboardCheck, AlertCircle, Cpu } from 'lucide-vue-next';
+import { ChevronLeft, Bug, AlertCircle, Cpu } from 'lucide-vue-next';
 
 const props = defineProps<{
   view: 'home' | 'chat';
@@ -43,6 +43,18 @@ const emit = defineEmits<{
               Agent
             </span>
           </span>
+          <button
+            v-if="view === 'chat'"
+            type="button"
+            class="inline-flex items-center justify-center rounded-lg p-1 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-zinc-900"
+            :class="debugCopyStatus === 'copied' ? 'text-emerald-500' : debugCopyStatus === 'error' ? 'text-red-500' : 'text-zinc-400 hover:text-zinc-600'"
+            :title="debugCopyStatus === 'copied' ? 'Copied!' : debugCopyStatus === 'error' ? 'Copy failed' : 'Copy debug info'"
+            aria-label="Copy debug info"
+            @click="emit('copy-debug')"
+          >
+            <AlertCircle v-if="debugCopyStatus === 'error'" class="size-3.5" />
+            <Bug v-else class="size-3.5" />
+          </button>
           <span
             v-if="workingDirectory && view === 'chat'"
             class="max-w-[320px] truncate rounded-md bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-500"
@@ -54,18 +66,6 @@ const emit = defineEmits<{
       </div>
 
       <div class="flex items-center gap-2">
-        <button
-          v-if="view === 'chat'"
-          type="button"
-          class="inline-flex size-7 items-center justify-center rounded-lg border border-zinc-200 text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-zinc-900"
-          :title="debugCopyStatus === 'copied' ? 'Copied!' : debugCopyStatus === 'error' ? 'Copy failed' : 'Copy debug info'"
-          aria-label="Copy debug info"
-          @click="emit('copy-debug')"
-        >
-          <ClipboardCheck v-if="debugCopyStatus === 'copied'" class="size-3.5 text-emerald-500" />
-          <AlertCircle v-else-if="debugCopyStatus === 'error'" class="size-3.5 text-red-500" />
-          <Clipboard v-else class="size-3.5" />
-        </button>
         <span class="max-w-[160px] truncate rounded-md bg-zinc-100 px-2.5 py-0.5 text-[11px] text-zinc-500" :title="userName">
           {{ userName }}
         </span>
