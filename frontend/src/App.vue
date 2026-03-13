@@ -1280,12 +1280,6 @@ async function loadModels() {
   }
 }
 
-function looksLikeCodexThreadId(value: string): boolean {
-  if (!value) return false;
-  if (value.startsWith('thr_')) return true;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
-}
-
 async function hydrateRoomFromThreadId(threadId: string) {
   const response = await apiFetch(`/api/rooms/${encodeURIComponent(threadId)}/thread`, {
     method: 'POST',
@@ -1769,13 +1763,6 @@ onMounted(async () => {
     try {
       await loadRuntime();
       await loadCodexThreads();
-      if (looksLikeCodexThreadId(roomId.value)) {
-        try {
-          await hydrateRoomFromThreadId(roomId.value);
-        } catch {
-          // Fall back to persisted room state if hydration fails.
-        }
-      }
       await loadState();
       await loadModels();
       connectEvents();
