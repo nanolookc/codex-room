@@ -241,6 +241,7 @@ const selectedEffortLabel = computed(() => {
 const selectedAccessLabel = computed(() =>
   accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
 );
+const latestTurnPlanTextByTurnId = ref(new Map<string, { text: string; at: string }>());
 
 watch(
   [selectedModel, modelOptions],
@@ -360,6 +361,7 @@ function resetCodexRuntimeState() {
   latestThreadUsageRaw = null;
   liveCodexItemState.clear();
   latestTurnDiffPatchByTurnId.clear();
+  latestTurnPlanTextByTurnId.value = new Map();
   recentDebugEvents.length = 0;
   pendingApproval.value = null;
   pendingApprovalResolver = null;
@@ -494,6 +496,43 @@ function codexItemIdFrom(value: any): string | null {
     (typeof value?.call_id === 'string' && value.call_id) ||
     null
   );
+}
+
+function findLogEntryIndexForCodexItem(itemId: string | null, turnId?: string | null): number {
+  if (!itemId) return -1;
+  let fallbackIndex = -1;
+  for (let i = logEntries.value.length - 1; i >= 0; i -= 1) {
+    const entry = logEntries.value[i];
+    const meta = normalizeMeta(entry) as any;
+    if (meta.kind !== 'codex.item') continue;
+    if ((meta.itemId ?? null) !== itemId) continue;
+    if (turnId !== undefined && (meta.turnId ?? null) !== (turnId ?? null)) {
+      if (fallbackIndex === -1) fallbackIndex = i;
+      continue;
+    }
+    return i;
+  }
+  return fallbackIndex;
+}
+
+function replaceLogEntry(index: number, entry: LogEntry) {
+  const next = [...logEntries.value];
+  next[index] = entry;
+  logEntries.value = next;
+}
+
+function shouldRenderStartedItem(itemType: string): boolean {
+  return [
+    'command_execution',
+    'file_change',
+    'mcp_tool_call',
+    'collab_tool_call',
+    'web_search',
+    'image_view',
+    'entered_review_mode',
+    'exited_review_mode',
+    'context_compaction'
+  ].includes(itemType);
 }
 
 function appendCodexTextField(target: Record<string, unknown>, key: string, chunk: unknown) {
@@ -735,7 +774,9 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
         ? `approval: ${String((item.approval as Record<string, unknown>).decision)}`
         : '',
       fileLines.length ? `files:\n${fileLines.map((l) => `- ${l}`).join('\n')}` : '',
-      typeof item.outputDelta === 'string' && item.outputDelta.trim() ? item.outputDelta.trim() : ''
+      typeof item.status === 'string' && item.status === 'failed' && typeof item.outputDelta === 'string' && item.outputDelta.trim()
+        ? `error:\n${item.outputDelta.trim()}`
+        : ''
     ].filter(Boolean);
     return parts.join('\n').trim() || safeJson(item);
   }
@@ -745,8 +786,29 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
     return rawPatch && hasPatchFileHeaders(rawPatch) ? '' : safeJson(item);
   }
 
-  if (itemType === 'mcp_tool_call' || itemType === 'collab_tool_call') {
-    return safeJson(item);
+  if (itemType === 'mcp_tool_call') {
+    const parts = [
+      typeof item.server === 'string' ? `server: ${item.server}` : '',
+      typeof item.tool === 'string' ? `tool: ${item.tool}` : '',
+      typeof item.status === 'string' ? `status: ${item.status}` : '',
+      item.arguments !== undefined ? `arguments:\n${safeJson(item.arguments)}` : '',
+      item.result !== undefined ? `result:\n${safeJson(item.result)}` : '',
+      item.error !== undefined ? `error:\n${safeJson(item.error)}` : ''
+    ].filter(Boolean);
+    return parts.join('\n').trim();
+  }
+
+  if (itemType === 'collab_tool_call') {
+    const parts = [
+      typeof item.tool === 'string' ? `tool: ${item.tool}` : '',
+      typeof item.status === 'string' ? `status: ${item.status}` : '',
+      typeof item.senderThreadId === 'string' ? `sender: ${item.senderThreadId}` : '',
+      typeof item.receiverThreadId === 'string' ? `receiver: ${item.receiverThreadId}` : '',
+      typeof item.newThreadId === 'string' ? `new thread: ${item.newThreadId}` : '',
+      typeof item.agentStatus === 'string' ? `agent: ${item.agentStatus}` : '',
+      typeof item.prompt === 'string' && item.prompt.trim() ? `prompt:\n${item.prompt.trim()}` : ''
+    ].filter(Boolean);
+    return parts.join('\n').trim();
   }
 
   if (itemType === 'model_reroute') {
@@ -757,20 +819,45 @@ function codexItemDetailsText(item: Record<string, unknown>, itemType: string): 
   }
 
   if (itemType === 'web_search' || itemType === 'image_view') {
-    return safeJson(item);
+    if (itemType === 'web_search') {
+      const action = item.action && typeof item.action === 'object' ? (item.action as Record<string, unknown>) : null;
+      const actionType =
+        typeof action?.type === 'string'
+          ? action.type
+          : typeof action?.action === 'string'
+            ? action.action
+            : '';
+      const parts = [
+        typeof item.query === 'string' ? `query: ${item.query}` : '',
+        actionType ? `action: ${actionType}` : '',
+        typeof action?.url === 'string' ? `url: ${action.url}` : '',
+        typeof action?.pattern === 'string' ? `pattern: ${action.pattern}` : ''
+      ].filter(Boolean);
+      return parts.join('\n').trim() || safeJson(item);
+    }
+    const path = typeof item.path === 'string' ? item.path : '';
+    return path ? `path: ${path}` : safeJson(item);
   }
 
   if (itemType === 'entered_review_mode' || itemType === 'exited_review_mode') {
     return typeof item.review === 'string' ? item.review : safeJson(item);
   }
 
+  if (itemType === 'context_compaction') {
+    return 'Conversation history compacted.';
+  }
+
   return safeJson(item);
 }
 
-function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string, options: { turnId?: string | null; itemId?: string | null } = {}) {
+function buildCodexItemTimelineEntry(
+  itemInput: Record<string, unknown>,
+  at: string,
+  options: { turnId?: string | null; itemId?: string | null } = {}
+): Omit<LogEntry, 'id'> | null {
   const item = itemInput && typeof itemInput === 'object' ? itemInput : ({ type: 'unknown' } as Record<string, unknown>);
   const itemType = codexItemTypeForUi(item);
-  if (itemType === 'user_message') return;
+  if (itemType === 'user_message') return null;
   const details = codexItemDetailsText(item, itemType).trim();
   const rawPatch = extractItemRawPatch(item, itemType) ?? undefined;
   const meta = {
@@ -779,13 +866,36 @@ function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string,
     ...(options.turnId ? { turnId: options.turnId } : {}),
     ...(options.itemId ? { itemId: options.itemId } : {})
   } as any;
-  pushEntry({
+  return {
     side: 'right',
     label: 'codex',
     text: `Item: ${itemType}${details ? `\n${details}` : ''}`,
     at,
     meta,
     rawPatch
+  };
+}
+
+function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string, options: { turnId?: string | null; itemId?: string | null } = {}) {
+  const entry = buildCodexItemTimelineEntry(itemInput, at, options);
+  if (!entry) return;
+  pushEntry(entry);
+}
+
+function upsertCodexItemTimeline(itemInput: Record<string, unknown>, at: string, options: { turnId?: string | null; itemId?: string | null } = {}) {
+  const entry = buildCodexItemTimelineEntry(itemInput, at, options);
+  if (!entry) return;
+  const itemId = options.itemId ?? codexItemIdFrom(itemInput);
+  const index = findLogEntryIndexForCodexItem(itemId, options.turnId);
+  if (index === -1) {
+    pushEntry(entry);
+    return;
+  }
+  const existing = logEntries.value[index];
+  replaceLogEntry(index, {
+    ...existing,
+    ...entry,
+    id: existing.id
   });
 }
 
@@ -820,13 +930,13 @@ function upsertTurnDiffEntryForTurn(turnId: string | null, patch: string, at: st
   return true;
 }
 
-function appendCodexTurnStarted(prompt: string, at: string, model?: string, reasoningEffort?: string) {
+function appendCodexTurnStarted(prompt: string, at: string, model?: string, reasoningEffort?: string, turnId?: string | null) {
   pushEntry({
     side: 'right',
     label: 'codex',
     text: `Started: ${prompt || '(resumed turn)'}`,
     at,
-    meta: { kind: 'codex.started', model, reasoningEffort }
+    meta: { kind: 'codex.started', model, reasoningEffort, ...(turnId ? { turnId } : {}) } as any
   });
   running.value = true;
   startWorkingTimer(at);
@@ -1449,11 +1559,25 @@ const contextAvailabilityTitle = computed(() => {
 
 type TurnSegment =
   | { type: 'message'; id: string; entry: LogEntry }
+  | { type: 'plan_state'; id: string; text: string }
   | { type: 'tech'; id: string; items: LogEntry[] };
+
+function turnGroupId(group: TurnGroup): string | null {
+  const startMeta = normalizeMeta(group.startEntry) as any;
+  if (typeof startMeta.turnId === 'string' && startMeta.turnId) return startMeta.turnId;
+  for (const item of group.items) {
+    const meta = normalizeMeta(item) as any;
+    if (typeof meta.turnId === 'string' && meta.turnId) return meta.turnId;
+  }
+  return null;
+}
 
 function turnSegments(group: TurnGroup): TurnSegment[] {
   const result: TurnSegment[] = [];
   let batch: LogEntry[] = [];
+  const turnId = turnGroupId(group);
+  const transientPlan = turnId ? latestTurnPlanTextByTurnId.value.get(turnId) : null;
+  const hasAuthoritativePlanItem = group.items.some((item) => normalizeMeta(item).itemType === 'plan');
 
   const flushBatch = () => {
     if (batch.length > 0) {
@@ -1461,6 +1585,10 @@ function turnSegments(group: TurnGroup): TurnSegment[] {
       batch = [];
     }
   };
+
+  if (transientPlan?.text.trim() && !hasAuthoritativePlanItem) {
+    result.push({ type: 'plan_state', id: `plan-state-${turnId}`, text: transientPlan.text.trim() });
+  }
 
   for (const item of group.items) {
     if (isHiddenItem(item)) continue;
@@ -1518,7 +1646,11 @@ function itemLabel(item: LogEntry): string {
     mcp_tool_call: 'tool',
     collab_tool_call: 'tool',
     web_search: 'web',
-    image_view: 'img'
+    image_view: 'img',
+    entered_review_mode: 'review',
+    exited_review_mode: 'review',
+    context_compaction: 'compact',
+    plan: 'plan'
   };
   return map[meta.itemType ?? ''] ?? (meta.itemType ?? 'item');
 }
@@ -1539,7 +1671,12 @@ function techSegmentSummary(items: LogEntry[]): string {
     'plan',
     'permission_request',
     'mcp_tool_call',
-    'collab_tool_call'
+    'collab_tool_call',
+    'web_search',
+    'image_view',
+    'entered_review_mode',
+    'exited_review_mode',
+    'context_compaction'
   ];
   entries.sort((a, b) => {
     const aIdx = orderedKeys.indexOf(a[0]);
@@ -1566,6 +1703,15 @@ function techSegmentSummary(items: LogEntry[]): string {
         case 'mcp_tool_call':
         case 'collab_tool_call':
           return format(count, 'tool call', 'tool calls');
+        case 'web_search':
+          return format(count, 'web action', 'web actions');
+        case 'image_view':
+          return format(count, 'image view', 'image views');
+        case 'entered_review_mode':
+        case 'exited_review_mode':
+          return format(count, 'review step', 'review steps');
+        case 'context_compaction':
+          return format(count, 'compaction', 'compactions');
         default:
           return format(count, type.replace(/_/g, ' '), `${type.replace(/_/g, ' ')}s`);
       }
@@ -1704,7 +1850,7 @@ function selectAccessMode(mode: AccessMode) {
 }
 
 function sandboxModeForMode(mode: AccessMode): string {
-  return mode === 'full-access' ? 'dangerFullAccess' : 'workspaceWrite';
+  return mode === 'full-access' ? 'danger-full-access' : 'workspace-write';
 }
 
 function sandboxPolicyForMode(mode: AccessMode): Record<string, unknown> {
@@ -1889,16 +2035,6 @@ async function respondToPermissionsRequest(requestId: number | string, params: a
     ? buildGrantedPermissions(requestedPermissions, outcome.grantedWriteRoots)
     : {};
 
-  pushEntry({
-    side: 'right',
-    label: 'codex',
-    text: accepted
-      ? `Item: permission_request\nGranted permissions${typeof params?.reason === 'string' ? `\n${params.reason}` : ''}`
-      : `Item: permission_request\nPermission request declined${typeof params?.reason === 'string' ? `\n${params.reason}` : ''}`,
-    at: new Date().toISOString(),
-    meta: { kind: 'codex.item', itemType: 'permission_request' }
-  });
-
   await codexRespond(requestId, {
     result: accepted
       ? {
@@ -1988,6 +2124,16 @@ function readFinalResponseFromTurn(turn: any): string {
   return '';
 }
 
+function codexTurnIdFromValue(value: any): string | null {
+  return (
+    (typeof value?.turnId === 'string' && value.turnId) ||
+    (typeof value?.turn_id === 'string' && value.turn_id) ||
+    (typeof value?.turn?.id === 'string' && value.turn.id) ||
+    activeCodexTurnId ||
+    null
+  );
+}
+
 function replayTurnsFromThreadRead(thread: any) {
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
   for (const turn of turns) {
@@ -2009,7 +2155,8 @@ function replayTurnsFromThreadRead(thread: any) {
       readPromptFromTurn(turn) || '(resumed turn)',
       baseAt,
       turnModel,
-      turnEffort
+      turnEffort,
+      turnId
     );
     syncComposerDefaults(turnModel, turnEffort);
     const items = Array.isArray(turn?.items) ? turn.items : [];
@@ -2140,7 +2287,8 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
         lastUserEntry?.text ?? '(running turn)',
         at,
         turnModel,
-        turnEffort
+        turnEffort,
+        typeof turn?.id === 'string' ? turn.id : null
       );
     }
     return;
@@ -2153,6 +2301,10 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       : { type: 'unknown' }) as Record<string, unknown>;
     const itemId = codexItemIdFrom(item);
     if (itemId) liveCodexItemState.set(itemId, item);
+    const turnId = codexTurnIdFromValue(params);
+    if (shouldRenderStartedItem(codexItemTypeForUi(item))) {
+      upsertCodexItemTimeline(item, at, { turnId, itemId });
+    }
     return;
   }
 
@@ -2164,6 +2316,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'agent_message' };
     appendCodexTextField(state, 'text', delta);
     liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
     return;
   }
 
@@ -2175,6 +2328,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'plan' };
     appendCodexTextField(state, 'text', delta);
     liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
     return;
   }
 
@@ -2188,6 +2342,23 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     appendCodexTextField(summary, 'text', delta);
     state.summary = summary;
     liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    return;
+  }
+
+  if (method === 'item/reasoning/summaryPartAdded') {
+    ensureLiveTurnStarted();
+    const itemId = codexItemIdFrom(params);
+    if (!itemId) return;
+    const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'reasoning' };
+    const summary = (state.summary ?? {}) as Record<string, unknown>;
+    const current = typeof summary.text === 'string' ? summary.text : '';
+    if (current.trim() && !current.endsWith('\n\n')) {
+      summary.text = `${current}\n\n`;
+    }
+    state.summary = summary;
+    liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
     return;
   }
 
@@ -2201,6 +2372,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     appendCodexTextField(content, 'text', delta);
     state.content = content;
     liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
     return;
   }
 
@@ -2212,6 +2384,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
     appendCodexTextField(state, 'aggregatedOutput', delta);
     liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
     return;
   }
 
@@ -2223,6 +2396,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'file_change' };
     appendCodexTextField(state, 'outputDelta', delta);
     liveCodexItemState.set(itemId, state);
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
     return;
   }
 
@@ -2235,8 +2409,14 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const base = itemId ? liveCodexItemState.get(itemId) : undefined;
     const merged = base ? ({ ...base, ...item } as Record<string, unknown>) : item;
     if (itemId) liveCodexItemState.delete(itemId);
-    appendCodexItemTimeline(merged, at, {
-      turnId: typeof params?.turnId === 'string' ? params.turnId : activeCodexTurnId,
+    const turnId = codexTurnIdFromValue(params);
+    if (codexItemTypeForUi(merged) === 'plan' && turnId) {
+      const next = new Map(latestTurnPlanTextByTurnId.value);
+      next.delete(turnId);
+      latestTurnPlanTextByTurnId.value = next;
+    }
+    upsertCodexItemTimeline(merged, at, {
+      turnId,
       itemId
     });
     return;
@@ -2268,7 +2448,12 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       const status = typeof entry?.status === 'string' ? entry.status : 'pending';
       return `${i + 1}. [${status}] ${step}`;
     });
-    appendCodexItemTimeline({ type: 'plan', text: [explanation, ...lines].filter(Boolean).join('\n'), plan }, at);
+    const turnId = codexTurnIdFromValue(params);
+    if (!turnId) return;
+    latestTurnPlanTextByTurnId.value = new Map(latestTurnPlanTextByTurnId.value).set(turnId, {
+      text: [explanation, ...lines].filter(Boolean).join('\n'),
+      at
+    });
     return;
   }
 
@@ -2294,6 +2479,9 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     }
     if (typeof turn?.id === 'string') {
       latestTurnDiffPatchByTurnId.delete(turn.id);
+      const next = new Map(latestTurnPlanTextByTurnId.value);
+      next.delete(turn.id);
+      latestTurnPlanTextByTurnId.value = next;
     }
     const status = typeof turn?.status === 'string' ? turn.status : 'completed';
     if (status === 'failed') {
@@ -2343,21 +2531,6 @@ async function handleCodexServerRequest(message: CodexRpcMessage) {
             decisions: approvalDecisionOptionsFromValue(params?.availableDecisions)
           });
     if (decision === 'cleared') return;
-
-    appendCodexItemTimeline(
-      {
-        type: method === 'item/fileChange/requestApproval' ? 'fileChange' : 'commandExecution',
-        id: itemId ?? undefined,
-        status: 'awaiting_approval',
-        approval: {
-          decision,
-          source: accessMode.value === 'full-access' ? 'frontend-auto' : 'frontend-inline',
-          method,
-          reason: typeof params?.reason === 'string' ? params.reason : undefined
-        }
-      },
-      new Date().toISOString()
-    );
     await codexRespond(requestId, { result: { decision } });
     return;
   }
@@ -3210,6 +3383,15 @@ onUnmounted(() => {
                     class="markdown-body text-sm leading-relaxed text-neutral-900"
                     v-html="renderMarkdown(bodyText(seg.entry))"
                   ></div>
+                </div>
+
+                <div v-else-if="seg.type === 'plan_state'" class="bg-neutral-50 px-4 py-3">
+                  <div class="flex gap-3 items-start">
+                    <span class="w-9 shrink-0 pt-0.5 text-right text-[9px] font-semibold uppercase tracking-wide text-neutral-400">
+                      plan
+                    </span>
+                    <pre class="m-0 whitespace-pre-wrap text-[12px] leading-relaxed text-neutral-600">{{ seg.text }}</pre>
+                  </div>
                 </div>
 
                 <!-- Tech group -->

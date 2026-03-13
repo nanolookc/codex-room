@@ -2,19 +2,22 @@
 import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 type StartOptions = {
   backendPort: number;
   host: string;
   room?: string;
   share: boolean;
+  safe: boolean;
 };
 
 function parseArgs(argv: string[]): { command: string | null; options: StartOptions } {
   const options: StartOptions = {
     backendPort: 3001,
     host: '127.0.0.1',
-    share: false
+    share: false,
+    safe: false
   };
 
   const [command, ...rest] = argv;
@@ -46,6 +49,11 @@ function parseArgs(argv: string[]): { command: string | null; options: StartOpti
       i++;
       continue;
     }
+
+    if (arg === '--safe') {
+      options.safe = true;
+      continue;
+    }
   }
 
   return { command: command ?? null, options };
@@ -66,10 +74,27 @@ function getPrimaryIp(): string {
 }
 
 function printUsage() {
-  console.log('Usage: codex-room start [--backend-port 3001] [--host 127.0.0.1] [--share] [--room <id>]');
+  console.log('Usage: codex-room start [--backend-port 3001] [--host 127.0.0.1] [--share] [--room <id>] [--safe]');
   console.log('If --room is omitted, a new room id is generated automatically.');
   console.log('A new session key is generated on each start and is required for all room API calls.');
+  console.log('Default mode expands the room to the Git repo root when available.');
+  console.log('--safe keeps the room limited to the exact current directory.');
   console.log('start serves already built frontend from backend (single process).');
+}
+
+function detectGitRoot(cwd: string): string | null {
+  try {
+    const result = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8'
+    });
+    if (result.status !== 0) return null;
+    const raw = result.stdout.trim();
+    return raw ? resolve(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 function runOrThrow(cmd: string[], cwd: string, label: string) {
@@ -87,7 +112,10 @@ function runOrThrow(cmd: string[], cwd: string, label: string) {
 }
 
 function runStart(options: StartOptions) {
-  const targetWorkdir = process.cwd();
+  const launchDirectory = process.cwd();
+  const gitRoot = detectGitRoot(launchDirectory);
+  const targetWorkdir =
+    options.safe || !gitRoot ? launchDirectory : gitRoot;
   const repoRoot = resolve(import.meta.dir, '../..');
   const frontendDist = resolve(repoRoot, 'frontend/dist');
   const indexPath = resolve(frontendDist, 'index.html');
@@ -134,7 +162,12 @@ function runStart(options: StartOptions) {
   const localUrl = `http://localhost:${options.backendPort}?${query}`;
   const shareUrl = `http://${ip}:${options.backendPort}?${query}`;
 
-  console.log(`\nCodex Room started for: ${targetWorkdir}`);
+  console.log(`\nCodex Room started for: ${launchDirectory}`);
+  console.log(`Scope mode: ${options.safe ? 'safe' : 'dangerous'}`);
+  console.log(`Effective project scope: ${targetWorkdir}`);
+  if (!options.safe && !gitRoot) {
+    console.log('Dangerous default requested, but no Git repo root was found. Using the current directory.');
+  }
   console.log(`Room: ${roomId}`);
   console.log(`Session Key: ${sessionKey}`);
   console.log(`Local URL: ${localUrl}`);

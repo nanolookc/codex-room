@@ -1,4 +1,5 @@
 import type { CodexRpcMessage, RoomEvent } from '@codex-room/shared';
+import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { AppServerSession } from './codex-app-server-session';
 import { AppLogger } from './logger';
@@ -155,6 +156,7 @@ const THREAD_SCOPED_METHODS = new Set([
 export class CodexRoomProxyManager {
   private readonly rooms = new Map<string, RoomSession>();
   private readonly workspaceRoot: string | null;
+  private readonly gitWorkspaceRoot: string | null;
   private readonly idleTtlMs = 15 * 60 * 1000;
   private readonly sweepInterval: ReturnType<typeof setInterval>;
 
@@ -166,6 +168,7 @@ export class CodexRoomProxyManager {
     private readonly reasoningEffort?: string
   ) {
     this.workspaceRoot = normalizePathForScope(workingDirectory);
+    this.gitWorkspaceRoot = this.detectGitWorkspaceRoot(workingDirectory);
     this.sweepInterval = setInterval(() => this.sweepIdleRooms(), 60_000);
     this.sweepInterval.unref?.();
   }
@@ -453,6 +456,11 @@ export class CodexRoomProxyManager {
       return obj;
     }
 
+    if (method === 'review/start') {
+      this.assertReviewScopeAllowed();
+      return obj;
+    }
+
     if (method === 'turn/start') {
       if (this.reasoningEffort && !obj.effort) obj.effort = this.reasoningEffort;
       if (this.workingDirectory) obj.cwd = this.workingDirectory;
@@ -516,5 +524,33 @@ export class CodexRoomProxyManager {
         `Thread is outside allowed workspace scope (thread cwd: ${threadCwd ?? 'unknown'}, allowed cwd: ${this.workspaceRoot})`
       );
     }
+  }
+
+  private detectGitWorkspaceRoot(workingDirectory?: string): string | null {
+    if (!workingDirectory) return null;
+    try {
+      const result = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: workingDirectory,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        encoding: 'utf8'
+      });
+      if (result.status !== 0) return null;
+      return normalizePathForScope(result.stdout);
+    } catch {
+      return null;
+    }
+  }
+
+  private assertReviewScopeAllowed() {
+    if (!this.workspaceRoot || !this.gitWorkspaceRoot) return;
+    if (this.workspaceRoot === this.gitWorkspaceRoot) return;
+
+    this.logger.warn('codex.review.scope.denied', {
+      allowedCwd: this.workspaceRoot,
+      gitWorkspaceRoot: this.gitWorkspaceRoot
+    });
+    throw new Error(
+      'review/start is blocked for subdirectory-scoped rooms because review operates on the wider git workspace. Start codex-room from the repo root to review changes safely.'
+    );
   }
 }
