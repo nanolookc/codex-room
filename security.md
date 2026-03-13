@@ -50,6 +50,23 @@ Direction:
 - emit a typed overflow event;
 - force state replay/resync on overflow.
 
+### 4. Public relay sharing adds a second security boundary
+
+The relay introduces a new public edge in front of the local room backend. This adds a distinct bearer-link/cookie trust boundary on top of the local `NLK_SESSION_KEY` boundary.
+
+Risk:
+- share links become public bearer credentials if leaked before cookie exchange;
+- relay bugs could route one viewer to the wrong host tunnel;
+- generic proxying would unnecessarily widen attack surface;
+- long-lived public sessions increase replay and abuse risk.
+
+Direction:
+- keep relay publishing explicit with `--publish`, never implicit on local start;
+- keep the relay on an explicit API allowlist instead of generic proxying;
+- use relay-issued viewer cookies and separate host tunnel tokens;
+- enforce invite TTLs, viewer caps, and rate limits;
+- keep workspace scope visible in public-share UX and do not weaken room isolation.
+
 ## Required Regression Coverage
 
 - `thread/read` for a foreign thread must be denied.
@@ -58,3 +75,6 @@ Direction:
 - `thread/loaded/list` must only return threads from the current workspace.
 - unsupported or blocked RPC methods must fail closed.
 - queue overflow must trigger client resync instead of silent continuation.
+- relay viewer cookies must not grant access to a different room.
+- relay requests must stay on the supported endpoint allowlist.
+- expired shares must reject both viewer traffic and host tunnel reconnects.

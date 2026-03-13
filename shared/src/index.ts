@@ -149,3 +149,4 @@ export interface CodexRpcRespondInput {
 }
 
 export * from './codexProtocol';
+export * from './relayProtocol';

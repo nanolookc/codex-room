@@ -3,6 +3,7 @@ import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { startRelayTunnel } from './services/relay-tunnel-client';
 
 type StartOptions = {
   backendPort: number;
@@ -10,6 +11,10 @@ type StartOptions = {
   room?: string;
   share: boolean;
   safe: boolean;
+  publish: boolean;
+  relayUrl?: string;
+  inviteTtlSeconds?: number;
+  maxViewers?: number;
 };
 
 function parseArgs(argv: string[]): { command: string | null; options: StartOptions } {
@@ -17,7 +22,8 @@ function parseArgs(argv: string[]): { command: string | null; options: StartOpti
     backendPort: 3001,
     host: '127.0.0.1',
     share: false,
-    safe: false
+    safe: false,
+    publish: false
   };
 
   const [command, ...rest] = argv;
@@ -54,6 +60,29 @@ function parseArgs(argv: string[]): { command: string | null; options: StartOpti
       options.safe = true;
       continue;
     }
+
+    if (arg === '--publish') {
+      options.publish = true;
+      continue;
+    }
+
+    if (arg === '--relay-url' && next) {
+      options.relayUrl = next;
+      i++;
+      continue;
+    }
+
+    if (arg === '--invite-ttl' && next) {
+      options.inviteTtlSeconds = Number(next);
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-viewers' && next) {
+      options.maxViewers = Number(next);
+      i++;
+      continue;
+    }
   }
 
   return { command: command ?? null, options };
@@ -74,11 +103,12 @@ function getPrimaryIp(): string {
 }
 
 function printUsage() {
-  console.log('Usage: codex-room start [--backend-port 3001] [--host 127.0.0.1] [--share] [--room <id>] [--safe]');
+  console.log('Usage: codex-room start [--backend-port 3001] [--host 127.0.0.1] [--share] [--room <id>] [--safe] [--publish] [--relay-url <url>] [--invite-ttl <seconds>] [--max-viewers <count>]');
   console.log('If --room is omitted, a new room id is generated automatically.');
   console.log('A new session key is generated on each start and is required for all room API calls.');
   console.log('Default mode expands the room to the Git repo root when available.');
   console.log('--safe keeps the room limited to the exact current directory.');
+  console.log('--publish creates a public share session through the configured relay.');
   console.log('start serves already built frontend from backend (single process).');
 }
 
@@ -111,7 +141,7 @@ function runOrThrow(cmd: string[], cwd: string, label: string) {
   }
 }
 
-function runStart(options: StartOptions) {
+async function runStart(options: StartOptions) {
   const launchDirectory = process.cwd();
   const gitRoot = detectGitRoot(launchDirectory);
   const targetWorkdir =
@@ -161,6 +191,31 @@ function runStart(options: StartOptions) {
   const query = `room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(sessionKey)}`;
   const localUrl = `http://localhost:${options.backendPort}?${query}`;
   const shareUrl = `http://${ip}:${options.backendPort}?${query}`;
+  const localApiBaseUrl = `http://127.0.0.1:${options.backendPort}`;
+  const abortController = new AbortController();
+  let relayTunnel: Awaited<ReturnType<typeof startRelayTunnel>> | null = null;
+
+  if (options.publish) {
+    if (!options.relayUrl?.trim()) {
+      backendProc.kill();
+      throw new Error('--publish requires --relay-url');
+    }
+
+    relayTunnel = await startRelayTunnel({
+      relayUrl: options.relayUrl,
+      localBaseUrl: localApiBaseUrl,
+      sessionKey,
+      roomId,
+      workspace: targetWorkdir,
+      hostName: launchDirectory,
+      ttlSeconds: options.inviteTtlSeconds,
+      maxViewers: options.maxViewers,
+      signal: abortController.signal,
+      onStatus(message) {
+        console.log(message);
+      }
+    });
+  }
 
   console.log(`\nCodex Room started for: ${launchDirectory}`);
   console.log(`Scope mode: ${options.safe ? 'safe' : 'dangerous'}`);
@@ -176,9 +231,16 @@ function runStart(options: StartOptions) {
   } else {
     console.log('LAN share is disabled by default. Re-run with `--share` to expose on local network.');
   }
+  if (relayTunnel) {
+    console.log(`Public URL: ${relayTunnel.share.viewerUrl}`);
+    console.log(`Invite expires: ${relayTunnel.share.expiresAt}`);
+    console.log(`Relay viewer limit: ${relayTunnel.share.maxViewers}`);
+  }
   console.log('Press Ctrl+C to stop.\n');
 
   const shutdown = () => {
+    abortController.abort();
+    relayTunnel?.close();
     backendProc.kill();
     process.exit(0);
   };
@@ -202,4 +264,7 @@ if (command !== 'start') {
   process.exit(1);
 }
 
-runStart(options);
+runStart(options).catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});

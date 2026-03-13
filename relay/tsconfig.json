@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["bun-types"],
+    "baseUrl": ".",
+    "paths": {
+      "@codex-room/shared": ["../shared/src"]
+    }
+  },
+  "include": ["src"]
+}
