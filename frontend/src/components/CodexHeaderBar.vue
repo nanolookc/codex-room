@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ChevronLeft, Bug, AlertCircle, Cpu } from 'lucide-vue-next';
+import { ChevronLeft, Bug, AlertCircle, Cpu, LogOut } from 'lucide-vue-next';
 
 const props = defineProps<{
   view: 'home' | 'chat';
+  canLogout: boolean;
   running: boolean;
   roomId: string;
   shortRoomId: string;
@@ -14,6 +15,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'go-home'): void;
   (e: 'copy-debug'): void;
+  (e: 'logout'): void;
 }>();
 </script>
 
@@ -66,6 +68,15 @@ const emit = defineEmits<{
       </div>
 
       <div class="flex items-center gap-2">
+        <button
+          v-if="canLogout"
+          type="button"
+          class="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-zinc-900"
+          @click="emit('logout')"
+        >
+          <LogOut class="size-4" />
+          Exit
+        </button>
         <span class="max-w-[160px] truncate rounded-md bg-zinc-100 px-2.5 py-0.5 text-[11px] text-zinc-500" :title="userName">
           {{ userName }}
         </span>

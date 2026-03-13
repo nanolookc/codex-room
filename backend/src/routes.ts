@@ -191,6 +191,7 @@ export function createApp(options: CreateAppOptions) {
       codexModel,
       codexReasoningEffort
     }))
+    .post('/api/logout', () => ({ ok: true }))
     .get('/api/codex/threads', async ({ query }) => {
       const limit = Number(query.limit ?? 30);
       const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 30;

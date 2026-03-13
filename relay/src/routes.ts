@@ -234,7 +234,7 @@ export function createApp(options: CreateAppOptions) {
           maxAge: created.maxAgeSeconds
         });
         set.status = 302;
-        set.headers.Location = `/?room=${encodeURIComponent(created.share.roomId)}`;
+        set.headers.Location = `/sessions?room=${encodeURIComponent(created.share.roomId)}`;
         return '';
       } catch (error) {
         set.status = 403;
@@ -243,6 +243,15 @@ export function createApp(options: CreateAppOptions) {
           headers: { 'Content-Type': 'text/plain; charset=utf-8' }
         });
       }
+    })
+    .post('/api/logout', ({ set }) => {
+      set.headers['Set-Cookie'] = serializeCookie(VIEWER_COOKIE, '', {
+        httpOnly: true,
+        sameSite: 'Lax',
+        secure: cookieSecure,
+        maxAge: 0
+      });
+      return { ok: true };
     })
     .ws('/api/tunnel/connect', {
       open(ws) {

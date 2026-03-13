@@ -60,6 +60,9 @@ import { useCursorOverlays } from './composables/useCursorOverlays';
 
 const query = new URLSearchParams(window.location.search);
 const API = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
+const landingPath = '/';
+const sessionsPath = '/sessions';
+const initialPathname = window.location.pathname === sessionsPath ? sessionsPath : landingPath;
 const roomFromQuery = query.get('room');
 const sessionKeyFromQuery = query.get('key')?.trim() ?? '';
 const publicRepoUrl = 'https://github.com/nanolookc/codex-room';
@@ -68,6 +71,7 @@ const initialRoomId = roomFromQuery ?? 'main';
 
 const roomId = ref(initialRoomId);
 const view = ref<'home' | 'chat'>(roomFromQuery ? 'chat' : 'home');
+const pathname = ref(initialPathname);
 const userId = ref(`u-${Math.random().toString(36).slice(2, 8)}`);
 const userName = ref(generateFunUserName());
 const workingDirectory = ref('');
@@ -156,7 +160,8 @@ const selectedAccessLabel = computed(() =>
   accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
 );
 const shortRoomId = computed(() => shortId(roomId.value));
-const showPublicLanding = computed(() => !sessionKeyFromQuery && !roomFromQuery && view.value === 'home');
+const showPublicLanding = computed(() => !sessionKeyFromQuery && pathname.value === landingPath && view.value === 'home');
+const canLogout = computed(() => !showPublicLanding.value);
 
 watch(
   [selectedModel, modelOptions],
@@ -351,6 +356,18 @@ function unauthorizedAccessMessage() {
     return 'Session key is missing or invalid. Re-open the room link from `codex-room start`.';
   }
   return 'Room access is missing or expired. Open the invite link again.';
+}
+
+function replaceLocation(nextPathname: string, nextRoomId?: string | null) {
+  const url = new URL(window.location.href);
+  url.pathname = nextPathname;
+  if (nextRoomId) {
+    url.searchParams.set('room', nextRoomId);
+  } else {
+    url.searchParams.delete('room');
+  }
+  window.history.replaceState({}, '', url.toString());
+  pathname.value = nextPathname;
 }
 
 function pushEntry(entry: Omit<LogEntry, 'id'>) {
@@ -1291,10 +1308,7 @@ async function switchRoom(nextRoomId: string) {
     stopWorkingTimer();
   }
 
-  const url = new URL(window.location.href);
-  url.searchParams.set('room', cleanRoomId);
-  window.history.replaceState({}, '', url.toString());
-
+  replaceLocation(sessionsPath, cleanRoomId);
   view.value = 'chat';
   await loadState();
   await loadModels();
@@ -1304,12 +1318,24 @@ async function switchRoom(nextRoomId: string) {
 
 function goHome() {
   eventsAbortController?.abort();
-  const url = new URL(window.location.href);
-  url.searchParams.delete('room');
-  window.history.replaceState({}, '', url.toString());
+  replaceLocation(sessionsPath);
   view.value = 'home';
   if (showPublicLanding.value) return;
   void loadCodexThreads();
+}
+
+async function logout() {
+  eventsAbortController?.abort();
+  try {
+    await apiFetch('/api/logout', { method: 'POST' });
+  } catch {
+    // Best effort: local mode only needs the URL cleanup.
+  }
+
+  const url = new URL(window.location.href);
+  url.pathname = landingPath;
+  url.search = '';
+  window.location.assign(url.toString());
 }
 
 async function openNewRoom() {
@@ -1767,6 +1793,10 @@ onMounted(async () => {
     await loadCodexThreads();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (message === 'Room access is missing or expired. Open the invite link again.' && pathname.value === sessionsPath) {
+      replaceLocation(landingPath);
+      return;
+    }
     if (message !== 'Room access is missing or expired. Open the invite link again.') {
       apiError.value = message;
     }
@@ -1787,6 +1817,7 @@ onUnmounted(() => {
   <div class="mx-auto flex h-dvh max-w-[720px] flex-col">
     <CodexHeaderBar
       :view="view"
+      :can-logout="canLogout"
       :running="running"
       :room-id="roomId"
       :short-room-id="shortRoomId"
@@ -1795,6 +1826,7 @@ onUnmounted(() => {
       :user-name="userName"
       @go-home="goHome"
       @copy-debug="copyDebugInfo"
+      @logout="logout"
     />
 
     <CodexErrorBanner

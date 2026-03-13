@@ -192,8 +192,8 @@ async function runStart(options: StartOptions) {
       ? crypto.randomUUID()
       : `room-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
   const query = `room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(sessionKey)}`;
-  const localUrl = `http://localhost:${options.backendPort}?${query}`;
-  const shareUrl = `http://${ip}:${options.backendPort}?${query}`;
+  const localUrl = `http://localhost:${options.backendPort}/sessions?${query}`;
+  const shareUrl = `http://${ip}:${options.backendPort}/sessions?${query}`;
   const localApiBaseUrl = `http://127.0.0.1:${options.backendPort}`;
   const abortController = new AbortController();
   let relayTunnel: Awaited<ReturnType<typeof startRelayTunnel>> | null = null;
