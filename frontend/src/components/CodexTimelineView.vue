@@ -186,7 +186,7 @@ function turnIsRunning(group: TurnGroup): boolean {
 
 function turnStatusClass(group: TurnGroup): string {
   if (turnIsRunning(group)) return 'bg-amber-400 animate-pulse';
-  if (!group.endEntry) return 'bg-neutral-300';
+  if (!group.endEntry) return 'bg-zinc-300';
   const kind = getEntryKind(group.endEntry);
   if (kind === 'codex.completed') return 'bg-emerald-400';
   if (kind === 'codex.interrupted') return 'bg-amber-400';
@@ -421,12 +421,12 @@ function itemBody(item: LogEntry): string {
 
 function itemTextClass(item: LogEntry): string {
   const meta = normalizeMeta(item);
-  if (meta.itemType === 'reasoning') return 'text-neutral-500 italic';
+  if (meta.itemType === 'reasoning') return 'text-zinc-400 italic';
   if (meta.itemType === 'model_reroute') return 'text-amber-700';
-  if (meta.itemType === 'command_execution') return 'font-mono text-neutral-700';
+  if (meta.itemType === 'command_execution') return 'font-mono text-zinc-700';
   if (meta.itemType === 'file_change') return 'font-mono text-teal-700';
   if (meta.itemType === 'turn_diff') return 'font-mono text-sky-700';
-  return 'text-neutral-700';
+  return 'text-zinc-700';
 }
 
 function itemRowAlignClass(item: LogEntry): string {
@@ -471,15 +471,24 @@ defineExpose({
 
 <template>
   <section ref="timelineEl" class="flex-1 overflow-y-auto" @scroll.passive="onTimelineScroll">
-    <div class="flex flex-col gap-3 px-5 py-5">
-      <div v-if="groups.length === 0" class="py-10 text-sm text-neutral-500">
-        <p class="mb-3">No messages yet in `{{ roomId }}`.</p>
+    <div class="flex flex-col gap-3 px-4 py-4">
+
+      <!-- Empty state -->
+      <div v-if="groups.length === 0" class="flex flex-col items-center justify-center py-20 text-center">
+        <div class="mb-4 flex size-14 items-center justify-center rounded-2xl bg-zinc-100">
+          <svg class="size-7 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
+          </svg>
+        </div>
+        <p class="text-[14px] font-medium text-zinc-700">Start a conversation</p>
+        <p class="mt-1 text-[12px] text-zinc-400">Type a message below to get going</p>
       </div>
 
       <template v-for="group in groups" :key="group.id">
-        <div v-if="group.type === 'message'" class="flex justify-start">
-          <div class="max-w-[78%] rounded-xl bg-neutral-200 px-4 py-3">
-            <pre class="m-0 whitespace-pre-wrap font-sans text-sm leading-relaxed text-neutral-900">{{ group.entry.text }}</pre>
+        <!-- User message bubble — right aligned -->
+        <div v-if="group.type === 'message'" class="flex justify-end">
+          <div class="max-w-[78%] rounded-2xl rounded-tr-sm bg-zinc-900 px-4 py-3">
+            <pre class="m-0 whitespace-pre-wrap font-sans text-sm leading-relaxed text-white">{{ group.entry.text }}</pre>
           </div>
         </div>
 

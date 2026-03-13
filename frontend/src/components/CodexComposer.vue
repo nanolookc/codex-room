@@ -40,16 +40,16 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <footer class="shrink-0 border-t border-neutral-200 bg-white/95 backdrop-blur-sm">
-    <div class="px-5 py-4">
-      <div class="rounded-2xl border border-neutral-300 bg-white px-3 py-3">
+  <footer class="shrink-0 border-t border-zinc-200 bg-white/95 backdrop-blur-sm">
+    <div class="px-4 py-3.5">
+      <div class="rounded-2xl border border-zinc-300 bg-white px-3.5 py-3 transition-colors focus-within:border-zinc-400">
         <div class="relative">
           <textarea
             :ref="setTextareaEl"
             :value="modelValue"
-            rows="5"
-            class="w-full resize-none border-0 bg-transparent px-0 pb-3 pt-0 font-sans text-sm text-neutral-900 outline-none placeholder:text-neutral-300"
-            placeholder="Write a prompt..."
+            rows="4"
+            class="w-full resize-none border-0 bg-transparent px-0 pb-2 pt-0 font-sans text-sm text-zinc-900 outline-none placeholder:text-zinc-300"
+            placeholder="Ask anything… (⌘↵ to run)"
             @input="emit('update:modelValue', ($event.target as HTMLTextAreaElement).value)"
             @keydown="emit('editor-keydown', $event)"
             @click="emit('editor-selection-change')"

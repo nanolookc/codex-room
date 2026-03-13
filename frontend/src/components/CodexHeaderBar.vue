@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { ChevronLeft, Clipboard, ClipboardCheck, AlertCircle, Cpu } from 'lucide-vue-next';
+
 const props = defineProps<{
   view: 'home' | 'chat';
   running: boolean;
@@ -16,45 +18,57 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <header class="sticky top-0 z-10 shrink-0 border-b border-neutral-200 bg-white/90 backdrop-blur-sm">
-    <div class="flex items-center justify-between px-5 py-3">
-      <div class="flex items-center gap-2">
+  <header class="sticky top-0 z-10 shrink-0 border-b border-zinc-200 bg-white/90 backdrop-blur-sm">
+    <div class="flex items-center justify-between px-4 py-2.5">
+      <div class="flex items-center gap-2.5">
         <button
           v-if="view === 'chat'"
           type="button"
-          class="rounded-md border border-neutral-200 px-2 py-0.5 text-[11px] text-neutral-600 hover:bg-neutral-100"
+          class="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-zinc-900"
           @click="emit('go-home')"
         >
-          ← Chats
+          <ChevronLeft class="size-4" />
+          Sessions
         </button>
-        <span
-          class="size-[7px] rounded-full transition-colors"
-          :class="running ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'"
-        ></span>
-        <span class="text-[13px] font-medium tracking-tight text-neutral-900">
-          <span v-if="view === 'chat'" :title="roomId">{{ shortRoomId }}</span>
-          <span v-else>Rooms</span>
-        </span>
-        <span
-          v-if="workingDirectory && view === 'chat'"
-          class="max-w-[360px] truncate text-[11px] text-neutral-400"
-          :title="workingDirectory"
-        >
-          {{ workingDirectory }}
-        </span>
+
+        <div class="flex items-center gap-2">
+          <span
+            class="size-2 rounded-full transition-colors"
+            :class="running ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'"
+          ></span>
+          <span class="text-[13px] font-semibold tracking-tight text-zinc-900">
+            <span v-if="view === 'chat'" :title="roomId">{{ shortRoomId }}</span>
+            <span v-else class="flex items-center gap-1.5">
+              <Cpu class="size-4 text-zinc-400" />
+              Agent
+            </span>
+          </span>
+          <span
+            v-if="workingDirectory && view === 'chat'"
+            class="max-w-[320px] truncate rounded-md bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-500"
+            :title="workingDirectory"
+          >
+            {{ workingDirectory }}
+          </span>
+        </div>
       </div>
+
       <div class="flex items-center gap-2">
         <button
           v-if="view === 'chat'"
           type="button"
-          class="inline-flex size-6 items-center justify-center rounded-md border border-neutral-200 text-[12px] text-neutral-600 hover:bg-neutral-100"
-          :title="debugCopyStatus === 'copied' ? 'Copied debug info' : debugCopyStatus === 'error' ? 'Copy debug failed' : 'Copy debug info'"
+          class="inline-flex size-7 items-center justify-center rounded-lg border border-zinc-200 text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-zinc-900"
+          :title="debugCopyStatus === 'copied' ? 'Copied!' : debugCopyStatus === 'error' ? 'Copy failed' : 'Copy debug info'"
           aria-label="Copy debug info"
           @click="emit('copy-debug')"
         >
-          {{ debugCopyStatus === 'copied' ? '✓' : debugCopyStatus === 'error' ? '!' : '⧉' }}
+          <ClipboardCheck v-if="debugCopyStatus === 'copied'" class="size-3.5 text-emerald-500" />
+          <AlertCircle v-else-if="debugCopyStatus === 'error'" class="size-3.5 text-red-500" />
+          <Clipboard v-else class="size-3.5" />
         </button>
-        <span class="max-w-[180px] truncate text-xs text-neutral-400" :title="userName">{{ userName }}</span>
+        <span class="max-w-[160px] truncate rounded-md bg-zinc-100 px-2.5 py-0.5 text-[11px] text-zinc-500" :title="userName">
+          {{ userName }}
+        </span>
       </div>
     </div>
   </header>
