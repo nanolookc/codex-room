@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { MessageSquarePlus, Clock, Zap } from 'lucide-vue-next';
+import { MessageSquarePlus, Clock, Zap, Globe, TerminalSquare, Github } from 'lucide-vue-next';
 import { formatThreadTime, type CodexThreadSummary } from '../lib/codexAppUi';
 
 defineProps<{
   codexThreads: CodexThreadSummary[];
+  publicLanding: boolean;
+  repoUrl: string;
+  startCommand: string;
 }>();
 
 const emit = defineEmits<{
@@ -15,6 +18,38 @@ const emit = defineEmits<{
 <template>
   <section class="flex-1 overflow-y-auto">
     <div class="px-4 py-4">
+      <div v-if="publicLanding" class="mx-auto flex max-w-[640px] flex-col gap-4 py-10">
+        <div class="rounded-[28px] border border-zinc-200 bg-gradient-to-br from-white via-zinc-50 to-zinc-100 p-6 shadow-sm">
+          <div class="mb-4 inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-zinc-500">
+            <Globe class="size-3.5" />
+            Public Relay
+          </div>
+          <h1 class="text-[28px] font-semibold tracking-tight text-zinc-950">Run Codex Room locally and share it from your own machine.</h1>
+          <p class="mt-3 max-w-[52ch] text-[14px] leading-6 text-zinc-600">
+            This host only relays published rooms. Start a local room with the CLI, then send the generated invite URL to another person.
+          </p>
+          <div class="mt-6 grid gap-3">
+            <a
+              :href="repoUrl"
+              target="_blank"
+              rel="noreferrer"
+              class="inline-flex items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 py-3 text-[13px] font-medium text-zinc-800 transition-colors hover:border-zinc-300 hover:bg-zinc-50"
+            >
+              <Github class="size-4" />
+              Open GitHub repo
+            </a>
+            <div class="rounded-2xl bg-zinc-950 p-4 text-left text-zinc-100 shadow-sm">
+              <div class="mb-2 inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.2em] text-zinc-400">
+                <TerminalSquare class="size-3.5" />
+                Start From Repo Root
+              </div>
+              <code class="block overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-zinc-100">{{ startCommand }}</code>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <template v-else>
       <!-- Header row -->
       <div class="mb-4 flex items-center justify-between">
         <span class="text-[11px] font-semibold uppercase tracking-widest text-zinc-400">Sessions</span>
@@ -68,6 +103,7 @@ const emit = defineEmits<{
           </button>
         </div>
       </div>
+      </template>
     </div>
   </section>
 </template>

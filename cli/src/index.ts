@@ -5,6 +5,8 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { startRelayTunnel } from './services/relay-tunnel-client';
 
+const DEFAULT_RELAY_URL = 'https://codex-room.hrebeni.uk';
+
 type StartOptions = {
   backendPort: number;
   host: string;
@@ -108,7 +110,8 @@ function printUsage() {
   console.log('A new session key is generated on each start and is required for all room API calls.');
   console.log('Default mode expands the room to the Git repo root when available.');
   console.log('--safe keeps the room limited to the exact current directory.');
-  console.log('--publish creates a public share session through the configured relay.');
+  console.log(`--publish creates a public share session through the default relay (${DEFAULT_RELAY_URL}).`);
+  console.log('--relay-url overrides the default relay for self-hosted or local relay deployments.');
   console.log('start serves already built frontend from backend (single process).');
 }
 
@@ -196,13 +199,10 @@ async function runStart(options: StartOptions) {
   let relayTunnel: Awaited<ReturnType<typeof startRelayTunnel>> | null = null;
 
   if (options.publish) {
-    if (!options.relayUrl?.trim()) {
-      backendProc.kill();
-      throw new Error('--publish requires --relay-url');
-    }
+    const relayUrl = options.relayUrl?.trim() || DEFAULT_RELAY_URL;
 
     relayTunnel = await startRelayTunnel({
-      relayUrl: options.relayUrl,
+      relayUrl,
       localBaseUrl: localApiBaseUrl,
       sessionKey,
       roomId,

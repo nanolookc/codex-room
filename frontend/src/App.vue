@@ -62,6 +62,8 @@ const query = new URLSearchParams(window.location.search);
 const API = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
 const roomFromQuery = query.get('room');
 const sessionKeyFromQuery = query.get('key')?.trim() ?? '';
+const publicRepoUrl = 'https://github.com/nanolookc/codex-room';
+const publicStartCommand = 'bun run ./cli/src/index.ts start --publish';
 const initialRoomId = roomFromQuery ?? 'main';
 
 const roomId = ref(initialRoomId);
@@ -154,6 +156,7 @@ const selectedAccessLabel = computed(() =>
   accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
 );
 const shortRoomId = computed(() => shortId(roomId.value));
+const showPublicLanding = computed(() => !sessionKeyFromQuery && view.value === 'home');
 
 watch(
   [selectedModel, modelOptions],
@@ -337,14 +340,17 @@ function apiHeaders(init?: HeadersInit): Headers {
 }
 
 async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const response = await fetch(`${API}${path}`, {
+  return fetch(`${API}${path}`, {
     ...init,
     headers: apiHeaders(init.headers)
   });
-  if (response.status === 401) {
-    apiError.value = 'Session key is missing or invalid. Re-open the room link from `codex-room start`.';
+}
+
+function unauthorizedAccessMessage() {
+  if (sessionKeyFromQuery) {
+    return 'Session key is missing or invalid. Re-open the room link from `codex-room start`.';
   }
-  return response;
+  return 'Room access is missing or expired. Open the invite link again.';
 }
 
 function pushEntry(entry: Omit<LogEntry, 'id'>) {
@@ -1197,6 +1203,9 @@ async function loadState() {
 
 async function loadRuntime() {
   const response = await apiFetch('/api/runtime');
+  if (response.status === 401) {
+    throw new Error(unauthorizedAccessMessage());
+  }
   if (!response.ok) throw new Error(`Failed to load runtime (${response.status})`);
   const data = await response.json();
   workingDirectory.value = data.workingDirectory ?? '';
@@ -1299,6 +1308,7 @@ function goHome() {
   url.searchParams.delete('room');
   window.history.replaceState({}, '', url.toString());
   view.value = 'home';
+  if (showPublicLanding.value) return;
   void loadCodexThreads();
 }
 
@@ -1728,10 +1738,11 @@ function onEditorKeydown(event: KeyboardEvent) {
 
 onMounted(async () => {
   window.addEventListener('resize', refreshCursorOverlays);
-  try {
-    await loadRuntime();
-    await loadCodexThreads();
-    if (view.value === 'chat') {
+  if (showPublicLanding.value) return;
+  if (view.value === 'chat') {
+    try {
+      await loadRuntime();
+      await loadCodexThreads();
       if (looksLikeCodexThreadId(roomId.value)) {
         try {
           await hydrateRoomFromThreadId(roomId.value);
@@ -1745,9 +1756,20 @@ onMounted(async () => {
       await timelineViewEl.value?.scrollToBottom(true);
       await nextTick();
       refreshCursorOverlays();
+    } catch (error) {
+      apiError.value = error instanceof Error ? error.message : String(error);
     }
+    return;
+  }
+
+  try {
+    await loadRuntime();
+    await loadCodexThreads();
   } catch (error) {
-    apiError.value = error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (message !== 'Room access is missing or expired. Open the invite link again.') {
+      apiError.value = message;
+    }
   }
 });
 
@@ -1784,6 +1806,9 @@ onUnmounted(() => {
 
     <CodexHomeView
       v-if="view === 'home'"
+      :public-landing="showPublicLanding"
+      :repo-url="publicRepoUrl"
+      :start-command="publicStartCommand"
       :codex-threads="codexThreads"
       @open-new-room="openNewRoom"
       @open-thread="openCodexThread"

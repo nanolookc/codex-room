@@ -46,10 +46,10 @@ Or run it directly:
 bun run --cwd relay src/index.ts
 ```
 
-Then start a room and publish it:
+Then start a room and publish it through the default public relay:
 
 ```bash
-codex-room start --publish --relay-url http://127.0.0.1:3010
+codex-room start --publish
 ```
 
 Example output:
@@ -60,7 +60,7 @@ Invite expires: 2026-03-14T14:40:39.161Z
 Relay viewer limit: 4
 ```
 
-The relay generates the public URL on the server side. The CLI only knows the relay API URL you pass via `--relay-url`.
+The relay generates the public URL on the server side. By default the CLI publishes through `https://codex-room.hrebeni.uk`. Use `--relay-url <url>` to override that for a local or self-hosted relay.
 
 ### Relay environment
 
