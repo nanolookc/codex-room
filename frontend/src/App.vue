@@ -156,7 +156,7 @@ const selectedAccessLabel = computed(() =>
   accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
 );
 const shortRoomId = computed(() => shortId(roomId.value));
-const showPublicLanding = computed(() => !sessionKeyFromQuery && view.value === 'home');
+const showPublicLanding = computed(() => !sessionKeyFromQuery && !roomFromQuery && view.value === 'home');
 
 watch(
   [selectedModel, modelOptions],
