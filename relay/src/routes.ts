@@ -90,10 +90,23 @@ function readClientIp(request: Request) {
 }
 
 function copyForwardHeaders(request: Request): Record<string, string> {
+  const allowed = new Set([
+    'accept',
+    'accept-language',
+    'cache-control',
+    'content-language',
+    'content-type',
+    'if-match',
+    'if-modified-since',
+    'if-none-match',
+    'if-unmodified-since',
+    'last-event-id',
+    'range'
+  ]);
   const headers: Record<string, string> = {};
   for (const [key, value] of request.headers.entries()) {
     const normalized = key.toLowerCase();
-    if (normalized === 'host' || normalized === 'cookie' || normalized === 'content-length') continue;
+    if (!allowed.has(normalized)) continue;
     headers[key] = value;
   }
   return headers;
