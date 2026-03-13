@@ -16,6 +16,8 @@
     "dev:backend": "bun run --cwd backend dev",
     "dev:frontend": "bun run --cwd frontend dev",
     "start:anywhere": "bun run ./cli/src/index.ts start",
-    "build": "bun run --cwd shared build && bun run --cwd backend build && bun run --cwd frontend build"
+    "build": "bun run --cwd shared build && bun run --cwd backend build && bun run --cwd frontend build",
+    "test": "bun test --runInBand",
+    "test:frontend": "bun test frontend/src --runInBand"
   }
 }

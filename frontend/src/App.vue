@@ -1,118 +1,78 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import MarkdownIt from 'markdown-it';
 import type {
   CodexRpcMessage,
   EditorCursor,
   RoomEvent,
   TimelineEntry
 } from '@codex-room/shared';
-import DiffPatch from './components/DiffPatch.vue';
 import {
+  codexItemIdFrom,
+  codexTurnIdFromValue,
+  extractCodexUsagePayload,
+  normalizeUsagePayload,
+  readFinalResponseFromTurn,
+  readPromptFromTurn,
+  usageFromEvent
+} from '@codex-room/shared';
+import CodexApprovalPanel from './components/CodexApprovalPanel.vue';
+import CodexComposer from './components/CodexComposer.vue';
+import CodexErrorBanner from './components/CodexErrorBanner.vue';
+import CodexHeaderBar from './components/CodexHeaderBar.vue';
+import CodexHomeView from './components/CodexHomeView.vue';
+import CodexPermissionsPanel from './components/CodexPermissionsPanel.vue';
+import CodexTimelineView from './components/CodexTimelineView.vue';
+import {
+  approvalPolicyForMode,
   approvalDecisionOptionsFromValue,
+  type AccessMode,
   buildGrantedPermissions,
   extractRequestedWriteRoots,
-  formatEffortLabel,
   parseModelEffortOptions,
-  threadStatusTypeFromValue,
-  type ApprovalDecision
+  sandboxModeForMode,
+  sandboxPolicyForMode,
+  threadStatusTypeFromValue
 } from './lib/codexProtocol';
-
-const markdown = new MarkdownIt({
-  html: false,
-  breaks: true,
-  linkify: true
-});
-
-const defaultLinkOpen =
-  markdown.renderer.rules.link_open ??
-  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
-
-markdown.renderer.rules.link_open = (tokens, idx, options, env, self) => {
-  tokens[idx]?.attrSet('target', '_blank');
-  tokens[idx]?.attrSet('rel', 'noopener noreferrer');
-  return defaultLinkOpen(tokens, idx, options, env, self);
-};
+import {
+  appendCodexTextField,
+  buildCodexItemTimelineEntry,
+  type CodexLogEntry as LogEntry,
+  codexItemTypeForUi,
+  extractItemRawPatch,
+  findLogEntryIndexForCodexItem,
+  isHiddenItem,
+  normalizeMeta,
+  shouldRenderStartedItem,
+  timelineEntryKind,
+  turnAlreadyContainsAgentMessage,
+  type UsageDisplay
+} from './lib/codexTimeline';
+import {
+  generateFunUserName,
+  shortId,
+  type ApprovalPromptOutcome,
+  type CodexThreadSummary,
+  type EffortOption,
+  type ModelOption,
+  type PendingApproval,
+  type PendingPermissionsRequest,
+  type PermissionPromptOutcome
+} from './lib/codexAppUi';
+import { useCursorOverlays } from './composables/useCursorOverlays';
 
 const query = new URLSearchParams(window.location.search);
 const API = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
 const roomFromQuery = query.get('room');
 const sessionKeyFromQuery = query.get('key')?.trim() ?? '';
 const initialRoomId = roomFromQuery ?? 'main';
+
 const roomId = ref(initialRoomId);
 const view = ref<'home' | 'chat'>(roomFromQuery ? 'chat' : 'home');
 const userId = ref(`u-${Math.random().toString(36).slice(2, 8)}`);
-const USER_ADJECTIVES = [
-  'Curious',
-  'Sleepy',
-  'Chaotic',
-  'Tiny',
-  'Cosmic',
-  'Sneaky',
-  'Wobbly',
-  'Spicy',
-  'Noisy',
-  'Mellow',
-  'Feral',
-  'Glitchy'
-];
-const USER_ANIMALS = [
-  'Raccoon',
-  'Dinosaur',
-  'Otter',
-  'Capybara',
-  'Lizard',
-  'Pigeon',
-  'Shark',
-  'Badger',
-  'Gecko',
-  'Yak',
-  'Mole',
-  'Falcon'
-];
 const userName = ref(generateFunUserName());
-const workingDirectory = ref<string>('');
-type CodexThreadSummary = {
-  id: string;
-  preview?: string;
-  updatedAt?: number;
-  createdAt?: number;
-  model?: string;
-  cwd?: string;
-  source?: string;
-};
+const workingDirectory = ref('');
 const codexThreads = ref<CodexThreadSummary[]>([]);
 const editorEl = ref<HTMLTextAreaElement | null>(null);
-
-const CURSOR_COLORS = [
-  '#ef4444',
-  '#f59e0b',
-  '#10b981',
-  '#06b6d4',
-  '#3b82f6',
-  '#8b5cf6',
-  '#ec4899'
-];
-const REMOTE_CURSOR_MAX_AGE_MS = 20_000;
-
-type CursorOverlay = {
-  userId: string;
-  userName: string;
-  color: string;
-  left: number;
-  top: number;
-  height: number;
-};
-
-type LogEntry = {
-  id: string;
-  side: 'left' | 'right';
-  label: string;
-  text: string;
-  at: string;
-  meta?: TimelineEntry['meta'];
-  rawPatch?: string;
-};
 
 type DebugEventSnapshot = {
   type: string;
@@ -120,68 +80,17 @@ type DebugEventSnapshot = {
   payload: unknown;
 };
 
-type ParsedCommandExecution = {
-  command: string;
-  exit: string;
-  output: string;
-  stdout: string;
-  stderr: string;
+type TimelineViewExposed = {
+  scrollToBottom: (force?: boolean) => Promise<void>;
 };
 
 const logEntries = ref<LogEntry[]>([]);
 const editorText = ref('');
 const editorCursors = ref<EditorCursor[]>([]);
 const editorVersion = ref(0);
-const cursorOverlays = ref<CursorOverlay[]>([]);
 const running = ref(false);
-const timelineEl = ref<HTMLElement | null>(null);
-const shouldAutoScrollTimeline = ref(true);
 const activeTaskStartedAt = ref<number | null>(null);
 const workingSeconds = ref(0);
-type UsageDisplay = {
-  input: number;
-  output: number;
-  total: number;
-  cachedInput?: number;
-  contextAvailablePercent?: number;
-};
-type EffortOption = {
-  id: string;
-  label: string;
-  description?: string;
-};
-type ModelOption = {
-  id: string;
-  label: string;
-  description?: string;
-  isDefault?: boolean;
-  effortOptions?: EffortOption[];
-  defaultEffort?: string;
-};
-type PendingApproval = {
-  requestId: number | string;
-  method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval';
-  itemId: string | null;
-  title: string;
-  reason: string;
-  command?: string;
-  patch?: string;
-  files?: string[];
-  decisions: ApprovalDecision[];
-};
-type PermissionPromptOutcome =
-  | { action: 'grant'; scope: 'turn' | 'session'; grantedWriteRoots: string[] }
-  | { action: 'decline' }
-  | 'cleared';
-type PendingPermissionsRequest = {
-  requestId: number | string;
-  reason: string;
-  permissions: Record<string, unknown>;
-  requestedWriteRoots: string[];
-  selectedWriteRoots: string[];
-};
-type AccessMode = 'full-access' | 'need-approve';
-type ApprovalPromptOutcome = ApprovalDecision | 'cleared';
 const usageByTurnAt = ref(new Map<string, UsageDisplay>());
 const latestUsageFromEvent = ref<UsageDisplay | null>(null);
 const currentThreadId = ref<string | null>(null);
@@ -194,10 +103,14 @@ const selectedEffort = ref('');
 const accessMode = ref<AccessMode>('full-access');
 const pendingApproval = ref<PendingApproval | null>(null);
 const pendingPermissionsRequest = ref<PendingPermissionsRequest | null>(null);
-const openMenu = ref<'model' | 'effort' | 'access' | null>(null);
-const modelMenuEl = ref<HTMLElement | null>(null);
-const effortMenuEl = ref<HTMLElement | null>(null);
-const accessMenuEl = ref<HTMLElement | null>(null);
+const timelineViewEl = ref<TimelineViewExposed | null>(null);
+
+const { cursorOverlays, refreshCursorOverlays } = useCursorOverlays({
+  editorEl,
+  editorText,
+  editorCursors,
+  userId
+});
 
 let eventsAbortController: AbortController | null = null;
 let editorTimer: number | null = null;
@@ -205,9 +118,10 @@ let workingTimer: number | null = null;
 let applyingRemoteEditorUpdate = false;
 let eventsConnectionSeq = 0;
 let activeCodexTurnId: string | null = null;
-let latestThreadUsageRaw: unknown = null;
+const latestThreadUsageRaw = ref<unknown>(null);
 const liveCodexItemState = new Map<string, Record<string, unknown>>();
 const latestTurnDiffPatchByTurnId = new Map<string, string>();
+const latestTurnPlanTextByTurnId = ref(new Map<string, { text: string; at: string }>());
 const recentDebugEvents: DebugEventSnapshot[] = [];
 const MAX_DEBUG_EVENTS = 300;
 let pendingApprovalResolver: ((decision: ApprovalPromptOutcome) => void) | null = null;
@@ -241,7 +155,7 @@ const selectedEffortLabel = computed(() => {
 const selectedAccessLabel = computed(() =>
   accessMode.value === 'full-access' ? 'Full Access' : 'Need Approve'
 );
-const latestTurnPlanTextByTurnId = ref(new Map<string, { text: string; at: string }>());
+const shortRoomId = computed(() => shortId(roomId.value));
 
 watch(
   [selectedModel, modelOptions],
@@ -261,19 +175,6 @@ function syncComposerDefaults(model?: string, reasoningEffort?: string) {
   }
   if (typeof reasoningEffort === 'string' && reasoningEffort.trim()) {
     selectedEffort.value = reasoningEffort.trim();
-  }
-}
-
-function approvalDecisionLabel(decision: ApprovalDecision): string {
-  switch (decision) {
-    case 'accept':
-      return 'Approve Once';
-    case 'acceptForSession':
-      return 'Approve Session';
-    case 'decline':
-      return 'Decline';
-    case 'cancel':
-      return 'Cancel';
   }
 }
 
@@ -339,26 +240,9 @@ function resolvePendingPermissions(outcome: PermissionPromptOutcome) {
   pendingPermissionsResolver?.(outcome);
 }
 
-function randomPick<T>(items: T[]): T {
-  return items[Math.floor(Math.random() * items.length)];
-}
-
-function generateFunUserName(): string {
-  const adjective = randomPick(USER_ADJECTIVES);
-  const animal = randomPick(USER_ANIMALS);
-  const suffix = Math.floor(Math.random() * 90) + 10;
-  return `${adjective} ${animal} ${suffix}`;
-}
-
-function shortId(value: string | null | undefined, head = 4, tail = 5): string {
-  if (!value) return '';
-  if (value.length <= head + tail + 3) return value;
-  return `${value.slice(0, head)}***${value.slice(-tail)}`;
-}
-
 function resetCodexRuntimeState() {
   activeCodexTurnId = null;
-  latestThreadUsageRaw = null;
+  latestThreadUsageRaw.value = null;
   liveCodexItemState.clear();
   latestTurnDiffPatchByTurnId.clear();
   latestTurnPlanTextByTurnId.value = new Map();
@@ -442,198 +326,10 @@ async function copyDebugInfo() {
   }, 2000);
 }
 
-function hasPatchFileHeaders(patch: string): boolean {
-  const candidate = patch.trim();
-  if (!candidate) return false;
-  return (
-    candidate.includes('diff --git ') ||
-    (candidate.includes('\n--- ') && candidate.includes('\n+++ ')) ||
-    candidate.startsWith('--- ')
-  );
-}
-
-function normalizeCodexItemType(type: unknown): string {
-  if (typeof type !== 'string') return 'unknown';
-  const map: Record<string, string> = {
-    userMessage: 'user_message',
-    UserMessage: 'user_message',
-    agentMessage: 'agent_message',
-    AgentMessage: 'agent_message',
-    reasoning: 'reasoning',
-    Reasoning: 'reasoning',
-    plan: 'plan',
-    Plan: 'plan',
-    commandExecution: 'command_execution',
-    CommandExecution: 'command_execution',
-    fileChange: 'file_change',
-    FileChange: 'file_change',
-    mcpToolCall: 'mcp_tool_call',
-    McpToolCall: 'mcp_tool_call',
-    collabToolCall: 'collab_tool_call',
-    CollabToolCall: 'collab_tool_call',
-    webSearch: 'web_search',
-    WebSearch: 'web_search',
-    imageView: 'image_view',
-    ImageView: 'image_view',
-    enteredReviewMode: 'entered_review_mode',
-    EnteredReviewMode: 'entered_review_mode',
-    exitedReviewMode: 'exited_review_mode',
-    ExitedReviewMode: 'exited_review_mode',
-    contextCompaction: 'context_compaction'
-  };
-  return map[type] ?? type;
-}
-
-function codexItemTypeForUi(item: any): string {
-  return normalizeCodexItemType(item?.type);
-}
-
-function codexItemIdFrom(value: any): string | null {
-  return (
-    (typeof value?.id === 'string' && value.id) ||
-    (typeof value?.itemId === 'string' && value.itemId) ||
-    (typeof value?.item_id === 'string' && value.item_id) ||
-    (typeof value?.call_id === 'string' && value.call_id) ||
-    null
-  );
-}
-
-function findLogEntryIndexForCodexItem(itemId: string | null, turnId?: string | null): number {
-  if (!itemId) return -1;
-  let fallbackIndex = -1;
-  for (let i = logEntries.value.length - 1; i >= 0; i -= 1) {
-    const entry = logEntries.value[i];
-    const meta = normalizeMeta(entry) as any;
-    if (meta.kind !== 'codex.item') continue;
-    if ((meta.itemId ?? null) !== itemId) continue;
-    if (turnId !== undefined && (meta.turnId ?? null) !== (turnId ?? null)) {
-      if (fallbackIndex === -1) fallbackIndex = i;
-      continue;
-    }
-    return i;
-  }
-  return fallbackIndex;
-}
-
 function replaceLogEntry(index: number, entry: LogEntry) {
   const next = [...logEntries.value];
   next[index] = entry;
   logEntries.value = next;
-}
-
-function shouldRenderStartedItem(itemType: string): boolean {
-  return [
-    'command_execution',
-    'file_change',
-    'mcp_tool_call',
-    'collab_tool_call',
-    'web_search',
-    'image_view',
-    'entered_review_mode',
-    'exited_review_mode',
-    'context_compaction'
-  ].includes(itemType);
-}
-
-function appendCodexTextField(target: Record<string, unknown>, key: string, chunk: unknown) {
-  if (typeof chunk !== 'string' || !chunk) return;
-  const prev = typeof target[key] === 'string' ? (target[key] as string) : '';
-  target[key] = `${prev}${chunk}`;
-}
-
-function extractCodexAgentMessageText(item: any): string {
-  if (!item || typeof item !== 'object') return '';
-  if (typeof item.text === 'string' && item.text.trim()) return item.text.trim();
-  if (Array.isArray(item.content)) {
-    return item.content
-      .map((part: any) => {
-        if (typeof part === 'string') return part;
-        if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-  }
-  return '';
-}
-
-function extractTextFragments(value: unknown): string[] {
-  if (!value) return [];
-  if (typeof value === 'string') {
-    const text = value.trim();
-    return text ? [text] : [];
-  }
-  if (Array.isArray(value)) {
-    return value.flatMap((entry) => extractTextFragments(entry));
-  }
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    const direct =
-      (typeof obj.text === 'string' && obj.text) ||
-      (typeof obj.content === 'string' && obj.content) ||
-      '';
-    if (direct.trim()) return [direct.trim()];
-    return [];
-  }
-  return [];
-}
-
-function uniqueTextParts(parts: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const part of parts) {
-    const normalized = part.trim();
-    if (!normalized) continue;
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
-  }
-  return out;
-}
-
-function extractCodexUsagePayload(value: any): unknown {
-  if (!value || typeof value !== 'object') return undefined;
-  const nested =
-    value.usage ??
-    value.tokenUsage ??
-    value.token_usage ??
-    value.turn?.usage ??
-    value.turn?.tokenUsage ??
-    value.turn?.token_usage ??
-    undefined;
-  if (!nested || typeof nested !== 'object') return nested;
-  if (
-    typeof value.modelContextWindow === 'number' ||
-    typeof value.model_context_window === 'number' ||
-    typeof value.contextWindowTokens === 'number' ||
-    typeof value.context_window_tokens === 'number'
-  ) {
-    return {
-      ...(nested as Record<string, unknown>),
-      ...(typeof value.modelContextWindow === 'number'
-        ? { modelContextWindow: value.modelContextWindow }
-        : {}),
-      ...(typeof value.model_context_window === 'number'
-        ? { model_context_window: value.model_context_window }
-        : {}),
-      ...(typeof value.contextWindowTokens === 'number'
-        ? { contextWindowTokens: value.contextWindowTokens }
-        : {}),
-      ...(typeof value.context_window_tokens === 'number'
-        ? { context_window_tokens: value.context_window_tokens }
-        : {})
-    };
-  }
-  return nested;
-}
-
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
 }
 
 function apiHeaders(init?: HeadersInit): Headers {
@@ -653,227 +349,18 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
   return response;
 }
 
-function compactDiffText(value: unknown): string {
-  if (!value) return '';
-  const raw =
-    typeof value === 'string'
-      ? value
-      : Array.isArray(value)
-        ? value.map((v) => compactDiffText(v)).join('\n')
-        : typeof value === 'object'
-          ? Object.values(value as Record<string, unknown>).map((v) => compactDiffText(v)).join('\n')
-          : String(value);
-  const lines = raw
-    .split('\n')
-    .map((line) => line.replace(/\r$/, ''))
-    .filter(Boolean)
-    .slice(0, 40);
-  return lines.join('\n').trim();
+function pushEntry(entry: Omit<LogEntry, 'id'>) {
+  logEntries.value = [
+    ...logEntries.value,
+    {
+      id: `${entry.side}-${entry.at}-${Math.random().toString(36).slice(2, 7)}`,
+      ...entry
+    }
+  ];
 }
 
-function pickRawPatchFromValue(value: unknown): string | null {
-  if (!value) return null;
-  if (typeof value === 'string') {
-    return value.trim() ? value : null;
-  }
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      const patch = pickRawPatchFromValue(entry);
-      if (patch) return patch;
-    }
-    return null;
-  }
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    for (const key of ['diff', 'patch', 'unified_diff', 'unifiedDiff']) {
-      const patch = pickRawPatchFromValue(obj[key]);
-      if (patch) return patch;
-    }
-    return null;
-  }
-  return null;
-}
-
-function extractItemRawPatch(item: Record<string, unknown>, itemType: string): string | null {
-  if (itemType !== 'file_change' && itemType !== 'turn_diff') return null;
-
-  const direct = pickRawPatchFromValue(item.diff ?? item.patch ?? item.unified_diff ?? item.unifiedDiff);
-  if (direct) return direct;
-
-  const changes = Array.isArray(item.changes) ? item.changes : [];
-  for (const change of changes) {
-    if (!change || typeof change !== 'object') continue;
-    const patch = pickRawPatchFromValue(change);
-    if (patch) return patch;
-  }
-
-  return null;
-}
-
-function codexItemDetailsText(item: Record<string, unknown>, itemType: string): string {
-  if (itemType === 'agent_message') return extractCodexAgentMessageText(item);
-
-  if (itemType === 'reasoning') {
-    const summaryParts = uniqueTextParts([
-      ...extractTextFragments((item.summary as any)?.text),
-      ...extractTextFragments(item.summary_text),
-      ...extractTextFragments(item.summary)
-    ]);
-    const summary = summaryParts.join('\n').trim();
-
-    const contentParts = uniqueTextParts([
-      ...extractTextFragments((item.content as any)?.text),
-      ...extractTextFragments(item.content),
-      ...extractTextFragments(item.raw_content)
-    ]);
-    const content = contentParts.join('\n').trim();
-
-    const blocks = uniqueTextParts([summary, content]);
-    return blocks.join('\n').trim();
-  }
-
-  if (itemType === 'plan') {
-    return typeof item.text === 'string' ? item.text : safeJson(item.plan ?? item);
-  }
-
-  if (itemType === 'command_execution') {
-    const parts: string[] = [];
-    if (item.command !== undefined) parts.push(`command: ${typeof item.command === 'string' ? item.command : safeJson(item.command)}`);
-    if (typeof item.status === 'string' && item.status.trim()) parts.push(`status: ${item.status.trim()}`);
-    if (item.approval && typeof item.approval === 'object') {
-      const approval = item.approval as Record<string, unknown>;
-      if (typeof approval.decision === 'string' && approval.decision.trim()) {
-        parts.push(`approval: ${approval.decision.trim()}`);
-      }
-      if (typeof approval.reason === 'string' && approval.reason.trim()) {
-        parts.push(`reason: ${approval.reason.trim()}`);
-      }
-    }
-    if (item.exitCode !== undefined || item.exit_code !== undefined) parts.push(`exit: ${String(item.exitCode ?? item.exit_code)}`);
-    const output = item.aggregatedOutput ?? item.aggregated_output ?? item.output;
-    if (typeof output === 'string' && output.trim()) parts.push(`output:\n${output.trim()}`);
-    if (typeof item.stderr === 'string' && item.stderr.trim()) parts.push(`stderr:\n${item.stderr.trim()}`);
-    if (typeof item.stdout === 'string' && item.stdout.trim()) parts.push(`stdout:\n${item.stdout.trim()}`);
-    return parts.join('\n').trim() || safeJson(item);
-  }
-
-  if (itemType === 'file_change') {
-    const changes = Array.isArray(item.changes) ? item.changes : [];
-    const fileLines = changes
-      .map((entry) => {
-        if (!entry || typeof entry !== 'object') return '';
-        const obj = entry as Record<string, unknown>;
-        const p = typeof obj.path === 'string' ? obj.path : '';
-        const kind = typeof obj.kind === 'string' ? obj.kind : '';
-        return [kind, p].filter(Boolean).join(': ');
-      })
-      .filter(Boolean);
-    const parts = [
-      typeof item.status === 'string' && item.status.trim() ? `status: ${item.status.trim()}` : '',
-      item.approval && typeof item.approval === 'object' && typeof (item.approval as Record<string, unknown>).decision === 'string'
-        ? `approval: ${String((item.approval as Record<string, unknown>).decision)}`
-        : '',
-      fileLines.length ? `files:\n${fileLines.map((l) => `- ${l}`).join('\n')}` : '',
-      typeof item.status === 'string' && item.status === 'failed' && typeof item.outputDelta === 'string' && item.outputDelta.trim()
-        ? `error:\n${item.outputDelta.trim()}`
-        : ''
-    ].filter(Boolean);
-    return parts.join('\n').trim() || safeJson(item);
-  }
-
-  if (itemType === 'turn_diff') {
-    const rawPatch = extractItemRawPatch(item, itemType);
-    return rawPatch && hasPatchFileHeaders(rawPatch) ? '' : safeJson(item);
-  }
-
-  if (itemType === 'mcp_tool_call') {
-    const parts = [
-      typeof item.server === 'string' ? `server: ${item.server}` : '',
-      typeof item.tool === 'string' ? `tool: ${item.tool}` : '',
-      typeof item.status === 'string' ? `status: ${item.status}` : '',
-      item.arguments !== undefined ? `arguments:\n${safeJson(item.arguments)}` : '',
-      item.result !== undefined ? `result:\n${safeJson(item.result)}` : '',
-      item.error !== undefined ? `error:\n${safeJson(item.error)}` : ''
-    ].filter(Boolean);
-    return parts.join('\n').trim();
-  }
-
-  if (itemType === 'collab_tool_call') {
-    const parts = [
-      typeof item.tool === 'string' ? `tool: ${item.tool}` : '',
-      typeof item.status === 'string' ? `status: ${item.status}` : '',
-      typeof item.senderThreadId === 'string' ? `sender: ${item.senderThreadId}` : '',
-      typeof item.receiverThreadId === 'string' ? `receiver: ${item.receiverThreadId}` : '',
-      typeof item.newThreadId === 'string' ? `new thread: ${item.newThreadId}` : '',
-      typeof item.agentStatus === 'string' ? `agent: ${item.agentStatus}` : '',
-      typeof item.prompt === 'string' && item.prompt.trim() ? `prompt:\n${item.prompt.trim()}` : ''
-    ].filter(Boolean);
-    return parts.join('\n').trim();
-  }
-
-  if (itemType === 'model_reroute') {
-    const fromModel = typeof item.fromModel === 'string' ? item.fromModel : 'unknown';
-    const toModel = typeof item.toModel === 'string' ? item.toModel : 'unknown';
-    const reason = typeof item.reason === 'string' ? item.reason.trim() : '';
-    return [`from: ${fromModel}`, `to: ${toModel}`, reason ? `reason: ${reason}` : ''].filter(Boolean).join('\n');
-  }
-
-  if (itemType === 'web_search' || itemType === 'image_view') {
-    if (itemType === 'web_search') {
-      const action = item.action && typeof item.action === 'object' ? (item.action as Record<string, unknown>) : null;
-      const actionType =
-        typeof action?.type === 'string'
-          ? action.type
-          : typeof action?.action === 'string'
-            ? action.action
-            : '';
-      const parts = [
-        typeof item.query === 'string' ? `query: ${item.query}` : '',
-        actionType ? `action: ${actionType}` : '',
-        typeof action?.url === 'string' ? `url: ${action.url}` : '',
-        typeof action?.pattern === 'string' ? `pattern: ${action.pattern}` : ''
-      ].filter(Boolean);
-      return parts.join('\n').trim() || safeJson(item);
-    }
-    const path = typeof item.path === 'string' ? item.path : '';
-    return path ? `path: ${path}` : safeJson(item);
-  }
-
-  if (itemType === 'entered_review_mode' || itemType === 'exited_review_mode') {
-    return typeof item.review === 'string' ? item.review : safeJson(item);
-  }
-
-  if (itemType === 'context_compaction') {
-    return 'Conversation history compacted.';
-  }
-
-  return safeJson(item);
-}
-
-function buildCodexItemTimelineEntry(
-  itemInput: Record<string, unknown>,
-  at: string,
-  options: { turnId?: string | null; itemId?: string | null } = {}
-): Omit<LogEntry, 'id'> | null {
-  const item = itemInput && typeof itemInput === 'object' ? itemInput : ({ type: 'unknown' } as Record<string, unknown>);
-  const itemType = codexItemTypeForUi(item);
-  if (itemType === 'user_message') return null;
-  const details = codexItemDetailsText(item, itemType).trim();
-  const rawPatch = extractItemRawPatch(item, itemType) ?? undefined;
-  const meta = {
-    kind: 'codex.item',
-    itemType,
-    ...(options.turnId ? { turnId: options.turnId } : {}),
-    ...(options.itemId ? { itemId: options.itemId } : {})
-  } as any;
-  return {
-    side: 'right',
-    label: 'codex',
-    text: `Item: ${itemType}${details ? `\n${details}` : ''}`,
-    at,
-    meta,
-    rawPatch
-  };
+function getEntryKind(entry: LogEntry): NonNullable<LogEntry['meta']>['kind'] {
+  return normalizeMeta(entry).kind;
 }
 
 function appendCodexItemTimeline(itemInput: Record<string, unknown>, at: string, options: { turnId?: string | null; itemId?: string | null } = {}) {
@@ -886,7 +373,7 @@ function upsertCodexItemTimeline(itemInput: Record<string, unknown>, at: string,
   const entry = buildCodexItemTimelineEntry(itemInput, at, options);
   if (!entry) return;
   const itemId = options.itemId ?? codexItemIdFrom(itemInput);
-  const index = findLogEntryIndexForCodexItem(itemId, options.turnId);
+  const index = findLogEntryIndexForCodexItem(logEntries.value, itemId, options.turnId);
   if (index === -1) {
     pushEntry(entry);
     return;
@@ -901,9 +388,9 @@ function upsertCodexItemTimeline(itemInput: Record<string, unknown>, at: string,
 
 function upsertTurnDiffEntryForTurn(turnId: string | null, patch: string, at: string): boolean {
   if (!turnId || !patch.trim()) return false;
-  for (let i = logEntries.value.length - 1; i >= 0; i--) {
+  for (let i = logEntries.value.length - 1; i >= 0; i -= 1) {
     const entry = logEntries.value[i];
-    const meta = normalizeMeta(entry) as any;
+    const meta = normalizeMeta(entry) as Record<string, unknown>;
     if (meta.kind !== 'codex.item' || meta.itemType !== 'turn_diff') continue;
     if ((meta.turnId ?? null) !== turnId) continue;
     const prevPatch = typeof entry.rawPatch === 'string' ? entry.rawPatch : '';
@@ -936,7 +423,7 @@ function appendCodexTurnStarted(prompt: string, at: string, model?: string, reas
     label: 'codex',
     text: `Started: ${prompt || '(resumed turn)'}`,
     at,
-    meta: { kind: 'codex.started', model, reasoningEffort, ...(turnId ? { turnId } : {}) } as any
+    meta: { kind: 'codex.started', model, reasoningEffort, ...(turnId ? { turnId } : {}) } as Record<string, unknown>
   });
   running.value = true;
   startWorkingTimer(at);
@@ -971,7 +458,7 @@ function appendCodexTurnTerminal(
     return;
   }
 
-  const parsed = usageFromEvent(options.usage ?? latestThreadUsageRaw);
+  const parsed = usageFromEvent(options.usage ?? latestThreadUsageRaw.value);
   if (parsed) {
     const next = new Map(usageByTurnAt.value);
     next.set(at, parsed);
@@ -986,7 +473,7 @@ function appendCodexTurnTerminal(
       ? `\nContext: ${parsed.contextAvailablePercent}% available`
       : '';
   const finalTextRaw = (options.finalResponse ?? '').trim();
-  const finalText = turnAlreadyContainsAgentMessage(finalTextRaw) ? '' : finalTextRaw;
+  const finalText = turnAlreadyContainsAgentMessage(logEntries.value, finalTextRaw) ? '' : finalTextRaw;
   pushEntry({
     side: 'right',
     label: 'codex',
@@ -995,874 +482,6 @@ function appendCodexTurnTerminal(
     meta: { kind: 'codex.completed' }
   });
   stopWorkingTimer(at);
-}
-
-function hashString(value: string): number {
-  let hash = 0;
-  for (let i = 0; i < value.length; i++) {
-    hash = (hash << 5) - hash + value.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash);
-}
-
-function colorForUser(user: string): string {
-  return CURSOR_COLORS[hashString(user) % CURSOR_COLORS.length] ?? CURSOR_COLORS[0];
-}
-
-function toMs(value: string): number {
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : 0;
-}
-
-function clampCursorPosition(position: number, textLength: number): number {
-  return Math.min(textLength, Math.max(0, Math.floor(position)));
-}
-
-function getCaretCoordinates(textarea: HTMLTextAreaElement, position: number) {
-  const doc = textarea.ownerDocument;
-  const mirror = doc.createElement('div');
-  const marker = doc.createElement('span');
-  const style = window.getComputedStyle(textarea);
-
-  const text = textarea.value;
-  const before = text.slice(0, position);
-
-  mirror.style.position = 'absolute';
-  mirror.style.top = '0';
-  mirror.style.left = '-9999px';
-  mirror.style.visibility = 'hidden';
-  mirror.style.whiteSpace = 'pre-wrap';
-  mirror.style.wordBreak = 'break-word';
-  mirror.style.overflow = 'hidden';
-  mirror.style.boxSizing = style.boxSizing;
-  mirror.style.width = `${textarea.clientWidth}px`;
-  mirror.style.height = `${textarea.clientHeight}px`;
-  mirror.style.padding = style.padding;
-  mirror.style.border = style.border;
-  mirror.style.font = style.font;
-  mirror.style.letterSpacing = style.letterSpacing;
-  mirror.style.lineHeight = style.lineHeight;
-  mirror.style.textTransform = style.textTransform;
-  mirror.style.textIndent = style.textIndent;
-  mirror.style.tabSize = style.tabSize;
-
-  mirror.textContent = before;
-  marker.textContent = '\u200b';
-  mirror.appendChild(marker);
-  doc.body.appendChild(mirror);
-
-  const left = marker.offsetLeft - textarea.scrollLeft;
-  const top = marker.offsetTop - textarea.scrollTop;
-  const lineHeight = Number.parseFloat(style.lineHeight) || Math.ceil(Number.parseFloat(style.fontSize) * 1.3);
-
-  doc.body.removeChild(mirror);
-  return { left, top, height: lineHeight };
-}
-
-function refreshCursorOverlays() {
-  const el = editorEl.value;
-  if (!el) {
-    cursorOverlays.value = [];
-    return;
-  }
-  const now = Date.now();
-  const next: CursorOverlay[] = [];
-
-  for (const cursor of editorCursors.value) {
-    if (!cursor || cursor.userId === userId.value) continue;
-    if (!cursor.updatedAt || now - toMs(cursor.updatedAt) > REMOTE_CURSOR_MAX_AGE_MS) continue;
-    const index = clampCursorPosition(cursor.selectionEnd ?? cursor.selectionStart ?? 0, editorText.value.length);
-    const coords = getCaretCoordinates(el, index);
-    if (coords.top + coords.height < 0 || coords.top > el.clientHeight) continue;
-    next.push({
-      userId: cursor.userId,
-      userName: cursor.userName || cursor.userId,
-      color: colorForUser(cursor.userId),
-      left: Math.max(0, coords.left),
-      top: Math.max(0, coords.top),
-      height: coords.height
-    });
-  }
-
-  cursorOverlays.value = next;
-}
-
-function normalizeMeta(entry: Pick<LogEntry, 'meta' | 'text' | 'side'>): NonNullable<LogEntry['meta']> {
-  if (entry.meta) return entry.meta;
-  if (entry.side === 'left') return { kind: 'user.message' };
-  if (entry.text.startsWith('Started:')) return { kind: 'codex.started' };
-  if (entry.text.startsWith('Turn completed')) return { kind: 'codex.completed' };
-  if (entry.text.startsWith('Turn interrupted')) return { kind: 'codex.interrupted' };
-  if (entry.text.startsWith('Error:')) return { kind: 'codex.failed' };
-  if (entry.text.startsWith('Item:')) {
-    const firstLine = entry.text.split('\n')[0] ?? '';
-    const itemType = firstLine.replace('Item:', '').trim() || 'unknown';
-    return { kind: 'codex.item', itemType };
-  }
-  return { kind: 'codex.item', itemType: 'unknown' };
-}
-
-function isEmptyRawReasoning(text: string): boolean {
-  const normalized = text.trim();
-  if (normalized === 'Item: reasoning') return true;
-  if (!normalized.startsWith('Item: reasoning')) return false;
-  if (!normalized.includes('\nraw:\n')) return false;
-  return (
-    /"summary"\s*:\s*\[\s*\]/.test(normalized) &&
-    /"content"\s*:\s*\[\s*\]/.test(normalized)
-  );
-}
-
-function isHiddenItem(entry: Pick<LogEntry, 'meta' | 'text' | 'side'>): boolean {
-  const meta = normalizeMeta(entry);
-  if (meta.kind !== 'codex.item') return false;
-  const itemType = (meta.itemType ?? '').toLowerCase();
-  if (itemType === 'user_message' || itemType === 'usermessage') return true;
-  if (itemType === 'reasoning' && isEmptyRawReasoning(entry.text)) return true;
-  const firstLine = entry.text.split('\n')[0]?.trim().toLowerCase() ?? '';
-  return firstLine === 'item: user_message' || firstLine === 'item: usermessage';
-}
-
-function badgeText(entry: LogEntry): string {
-  const meta = normalizeMeta(entry);
-  if (meta.kind === 'user.message') return 'user';
-  if (meta.kind === 'codex.started') return 'started';
-  if (meta.kind === 'codex.completed') return 'done';
-  if (meta.kind === 'codex.interrupted') return 'stopped';
-  if (meta.kind === 'codex.failed') return 'error';
-  return meta.itemType ?? 'item';
-}
-
-function badgeClass(entry: LogEntry): string {
-  const meta = normalizeMeta(entry);
-  if (meta.kind === 'user.message') return 'bg-neutral-100 text-neutral-500';
-  if (meta.kind === 'codex.started') return 'bg-blue-50 text-blue-600';
-  if (meta.kind === 'codex.completed') return 'bg-emerald-50 text-emerald-600';
-  if (meta.kind === 'codex.interrupted') return 'bg-amber-50 text-amber-700';
-  if (meta.kind === 'codex.failed') return 'bg-red-50 text-red-600';
-  if (meta.itemType === 'reasoning') return 'bg-amber-50 text-amber-600';
-  if (meta.itemType === 'command_execution') return 'bg-indigo-50 text-indigo-600';
-  if (meta.itemType === 'file_change') return 'bg-teal-50 text-teal-600';
-  if (meta.itemType === 'agent_message') return 'bg-purple-50 text-purple-600';
-  return 'bg-neutral-100 text-neutral-500';
-}
-
-function renderMarkdown(text: string): string {
-  return markdown.render(text);
-}
-
-function itemRawBodyText(entry: LogEntry): string {
-  if (!entry.text.startsWith('Item:')) return entry.text;
-  return entry.text.split('\n').slice(1).join('\n').trim() || '(no details)';
-}
-
-function bodyText(entry: LogEntry): string {
-  const meta = normalizeMeta(entry);
-  if (meta.kind === 'codex.item' && entry.text.startsWith('Item:')) {
-    let body = itemRawBodyText(entry);
-    if (meta.itemType === 'file_change') {
-      const diffMarker = '\ndiff:\n';
-      const diffIndex = body.indexOf(diffMarker);
-      if (diffIndex >= 0) {
-        body = body.slice(0, diffIndex).trim();
-      } else if (body.startsWith('diff:\n')) {
-        body = '';
-      } else {
-        const diffHeaderIndex = body.indexOf('\ndiff --git');
-        if (diffHeaderIndex >= 0) {
-          body = body.slice(0, diffHeaderIndex).trim();
-        } else if (body.startsWith('diff --git')) {
-          body = '';
-        }
-      }
-    }
-    return body || '(no details)';
-  }
-  if (meta.kind === 'codex.completed' && entry.text.startsWith('Turn completed')) {
-    return entry.text.replace(/^Turn completed\n?/, '').trim() || 'Turn completed';
-  }
-  if (meta.kind === 'codex.interrupted') return 'Turn interrupted';
-  return entry.text;
-}
-
-function pushEntry(entry: Omit<LogEntry, 'id'>) {
-  logEntries.value = [
-    ...logEntries.value,
-    {
-      id: `${entry.side}-${entry.at}-${Math.random().toString(36).slice(2, 7)}`,
-      ...entry
-    }
-  ];
-}
-
-function turnAlreadyContainsAgentMessage(finalText: string): boolean {
-  const normalizedFinal = finalText.trim();
-  if (!normalizedFinal) return false;
-  for (let i = logEntries.value.length - 1; i >= 0; i -= 1) {
-    const entry = logEntries.value[i];
-    const kind = getEntryKind(entry);
-    if (kind === 'codex.started') break;
-    if (kind !== 'codex.item') continue;
-    if (normalizeMeta(entry).itemType !== 'agent_message') continue;
-    if (bodyText(entry).trim() === normalizedFinal) return true;
-  }
-  return false;
-}
-
-function getEntryKind(entry: LogEntry): NonNullable<LogEntry['meta']>['kind'] {
-  return normalizeMeta(entry).kind;
-}
-
-function formatDuration(totalSeconds: number, prefix = ''): string {
-  const safe = Math.max(0, totalSeconds);
-  const minutes = Math.floor(safe / 60);
-  const seconds = safe % 60;
-  return `${prefix}${minutes}m ${seconds.toString().padStart(2, '0')}s`;
-}
-
-const turnDurationByEntryId = computed(() => {
-  const map = new Map<string, string>();
-  let startedAtMs: number | null = null;
-  let lastCodexEntryId: string | null = null;
-
-  for (const entry of logEntries.value) {
-    const kind = getEntryKind(entry);
-
-    if (kind === 'user.message') {
-      continue;
-    }
-
-    if (kind === 'codex.started') {
-      const started = new Date(entry.at).getTime();
-      startedAtMs = Number.isNaN(started) ? null : started;
-      lastCodexEntryId = entry.id;
-      continue;
-    }
-
-    if (startedAtMs === null) continue;
-
-    if (kind === 'codex.item') {
-      lastCodexEntryId = entry.id;
-      continue;
-    }
-
-    if (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted') {
-      const ended = new Date(entry.at).getTime();
-      const endedMs = Number.isNaN(ended) ? Date.now() : ended;
-      const totalSeconds = Math.floor((endedMs - startedAtMs) / 1000);
-      map.set(entry.id, formatDuration(totalSeconds, 'Worked '));
-      startedAtMs = null;
-      lastCodexEntryId = null;
-    }
-  }
-
-  if (running.value && activeTaskStartedAt.value && lastCodexEntryId) {
-    map.set(lastCodexEntryId, formatDuration(workingSeconds.value, 'Working '));
-  }
-
-  return map;
-});
-
-function durationLabel(entry: LogEntry): string | null {
-  return turnDurationByEntryId.value.get(entry.id) ?? null;
-}
-
-function formatThreadTime(unixSeconds?: number): string {
-  if (!unixSeconds || !Number.isFinite(unixSeconds)) return 'unknown';
-  return new Date(unixSeconds * 1000).toLocaleString();
-}
-
-// ── Display groups ────────────────────────────────────────────────
-
-type TurnGroup = {
-  type: 'turn';
-  id: string;
-  startEntry: LogEntry;
-  items: LogEntry[];
-  endEntry?: LogEntry;
-};
-
-type MessageGroup = {
-  type: 'message';
-  id: string;
-  entry: LogEntry;
-};
-
-type DisplayGroup = TurnGroup | MessageGroup;
-
-const groups = computed<DisplayGroup[]>(() => {
-  const result: DisplayGroup[] = [];
-  let current: TurnGroup | null = null;
-
-  for (const entry of logEntries.value) {
-    const kind = getEntryKind(entry);
-
-    if (kind === 'user.message') {
-      if (current) { result.push(current); current = null; }
-      result.push({ type: 'message', id: entry.id, entry });
-      continue;
-    }
-    if (kind === 'codex.started') {
-      if (current) result.push(current);
-      current = { type: 'turn', id: entry.id, startEntry: entry, items: [] };
-      continue;
-    }
-    if (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted') {
-      if (current) { current.endEntry = entry; result.push(current); current = null; }
-      continue;
-    }
-    if (current) current.items.push(entry);
-    else result.push({ type: 'message', id: entry.id, entry });
-  }
-
-  if (current) result.push(current);
-  return result;
-});
-
-function turnPrompt(group: TurnGroup): string {
-  const t = group.startEntry.text;
-  return t.startsWith('Started:') ? t.slice(8).trim() : t;
-}
-
-function turnIsRunning(group: TurnGroup): boolean {
-  return !group.endEntry && running.value;
-}
-
-function turnStatusClass(group: TurnGroup): string {
-  if (turnIsRunning(group)) return 'bg-amber-400 animate-pulse';
-  if (!group.endEntry) return 'bg-neutral-300';
-  const kind = getEntryKind(group.endEntry);
-  if (kind === 'codex.completed') return 'bg-emerald-400';
-  if (kind === 'codex.interrupted') return 'bg-amber-400';
-  return 'bg-red-400';
-}
-
-function turnMeta(group: TurnGroup): string {
-  const meta = group.startEntry.meta;
-  const time = new Date(group.startEntry.at).toLocaleTimeString();
-  const modelPart = meta?.model ? ` · ${meta.model}` : '';
-  const effortPart = meta?.reasoningEffort ? ` · effort:${meta.reasoningEffort}` : '';
-  if (turnIsRunning(group)) return `${time} · ${formatDuration(workingSeconds.value)}${modelPart}${effortPart}`;
-  if (!group.endEntry) return `${time}${modelPart}${effortPart}`;
-  const dur = durationLabel(group.endEntry)?.replace('Worked ', '') ?? '';
-  const base = dur ? `${time} · ${dur}` : time;
-  return `${base}${modelPart}${effortPart}`;
-}
-
-function turnUsage(group: TurnGroup): string | null {
-  const end = group.endEntry;
-  if (!end || getEntryKind(end) !== 'codex.completed') return null;
-  const usageFromEvent = usageByTurnAt.value.get(end.at);
-  if (usageFromEvent) {
-    return `in ${usageFromEvent.input}${usageFromEvent.cachedInput ? ` (cached ${usageFromEvent.cachedInput})` : ''} · out ${usageFromEvent.output} · total ${usageFromEvent.total}`;
-  }
-  const match = end.text.match(/^Tokens:\s*(.+)$/m);
-  return match?.[1]?.trim() ?? null;
-}
-
-function turnContext(group: TurnGroup): string | null {
-  const end = group.endEntry;
-  if (!end || getEntryKind(end) !== 'codex.completed') return null;
-  const fromUsage = usageByTurnAt.value.get(end.at)?.contextAvailablePercent;
-  if (typeof fromUsage === 'number') return `${fromUsage}% available`;
-  const match = end.text.match(/^Context:\s*(.+)$/m);
-  return match?.[1]?.trim() ?? null;
-}
-
-function turnMetaTitle(group: TurnGroup): string {
-  const details: string[] = [turnMeta(group)];
-  const usage = turnUsage(group);
-  if (usage) details.push(`Tokens: ${usage}`);
-  const context = turnContext(group);
-  if (context) details.push(`Context: ${context}`);
-  return details.join('\n');
-}
-
-function toFiniteNumber(value: unknown): number | null {
-  const n = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function pickNumber(obj: Record<string, unknown>, keys: string[]): number | null {
-  for (const key of keys) {
-    const n = toFiniteNumber(obj[key]);
-    if (n !== null) return n;
-  }
-  return null;
-}
-
-function normalizeUsagePayload(usage: unknown): Record<string, unknown> | null {
-  if (!usage || typeof usage !== 'object') return null;
-  const u = usage as Record<string, unknown>;
-  const nested =
-    (u.usage && typeof u.usage === 'object' ? (u.usage as Record<string, unknown>) : null) ??
-    (u.tokenUsage && typeof u.tokenUsage === 'object' ? (u.tokenUsage as Record<string, unknown>) : null) ??
-    (u.token_usage && typeof u.token_usage === 'object' ? (u.token_usage as Record<string, unknown>) : null) ??
-    u;
-  const totalObj =
-    nested.total && typeof nested.total === 'object' ? (nested.total as Record<string, unknown>) : null;
-  const lastObj =
-    nested.last && typeof nested.last === 'object' ? (nested.last as Record<string, unknown>) : null;
-  return { ...nested, ...(totalObj ?? lastObj ?? {}) };
-}
-
-function extractContextAvailabilityPercent(usage: unknown): number | null {
-  const obj = normalizeUsagePayload(usage);
-  if (!obj) return null;
-
-  const directPercent = pickNumber(obj, [
-    'contextAvailablePercent',
-    'context_available_percent',
-    'remainingPercent',
-    'remaining_percent'
-  ]);
-  if (directPercent !== null) {
-    return Math.min(100, Math.max(0, Math.round(directPercent)));
-  }
-
-  const contextWindow = pickNumber(obj, [
-    'contextWindowTokens',
-    'context_window_tokens',
-    'contextWindow',
-    'context_window',
-    'modelContextWindow',
-    'model_context_window',
-    'maxInputTokens',
-    'max_input_tokens',
-    'maxTokens',
-    'max_tokens'
-  ]);
-  if (!contextWindow || contextWindow <= 0) return null;
-
-  const remaining = pickNumber(obj, [
-    'remainingTokens',
-    'remaining_tokens',
-    'availableTokens',
-    'available_tokens',
-    'contextRemainingTokens',
-    'context_remaining_tokens'
-  ]);
-  if (remaining !== null) {
-    return Math.min(100, Math.max(0, Math.round((remaining / contextWindow) * 100)));
-  }
-
-  const used = pickNumber(obj, [
-    'totalTokens',
-    'total_tokens',
-    'inputTokens',
-    'input_tokens',
-    'promptTokens',
-    'prompt_tokens'
-  ]);
-  if (used !== null) {
-    return Math.min(100, Math.max(0, Math.round(((contextWindow - used) / contextWindow) * 100)));
-  }
-
-  return null;
-}
-
-function usageFromEvent(usage: unknown): UsageDisplay | null {
-  const obj = normalizeUsagePayload(usage);
-  if (!obj) return null;
-
-  const input = pickNumber(obj, ['inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens']) ?? 0;
-  const output = pickNumber(obj, ['outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens']) ?? 0;
-  const total = pickNumber(obj, ['totalTokens', 'total_tokens']) ?? input + output;
-  const cachedInput =
-    pickNumber(obj, ['cachedInputTokens', 'cached_input_tokens']) ??
-    (obj.inputTokensDetails && typeof obj.inputTokensDetails === 'object'
-      ? pickNumber(obj.inputTokensDetails as Record<string, unknown>, ['cachedTokens', 'cached_tokens'])
-      : null) ??
-    (obj.input_tokens_details && typeof obj.input_tokens_details === 'object'
-      ? pickNumber(obj.input_tokens_details as Record<string, unknown>, ['cachedTokens', 'cached_tokens'])
-      : null) ??
-    null;
-  const contextAvailablePercentRaw = extractContextAvailabilityPercent(usage);
-  const contextAvailablePercent = contextAvailablePercentRaw === null ? undefined : contextAvailablePercentRaw;
-
-  if (!input && !output && !total && contextAvailablePercent === undefined) return null;
-  return {
-    input,
-    output,
-    total,
-    ...(cachedInput && cachedInput > 0 ? { cachedInput } : {}),
-    ...(contextAvailablePercent !== undefined ? { contextAvailablePercent } : {})
-  };
-}
-
-const latestContextAvailablePercent = computed(() => {
-  const fromLiveUsage = usageFromEvent(latestThreadUsageRaw)?.contextAvailablePercent;
-  if (fromLiveUsage !== undefined) return fromLiveUsage;
-  for (let i = groups.value.length - 1; i >= 0; i -= 1) {
-    const group = groups.value[i];
-    if (group.type !== 'turn' || !group.endEntry) continue;
-    const fromReplayUsage = usageByTurnAt.value.get(group.endEntry.at)?.contextAvailablePercent;
-    if (typeof fromReplayUsage === 'number') return fromReplayUsage;
-  }
-  return null;
-});
-
-const contextAvailabilityText = computed(() => {
-  if (latestUsageFromEvent.value?.contextAvailablePercent !== undefined) {
-    return `Context available: ${latestUsageFromEvent.value.contextAvailablePercent}%`;
-  }
-  if (running.value) {
-    return 'Context available: --%';
-  }
-  if (latestContextAvailablePercent.value !== null) {
-    return `Context available: ${latestContextAvailablePercent.value}%`;
-  }
-  return 'Context available: --%';
-});
-
-const contextAvailabilityTitle = computed(() => {
-  const lines = [contextAvailabilityText.value];
-  const usage = latestUsageFromEvent.value;
-  if (usage) {
-    lines.push(`Tokens: in ${usage.input}${usage.cachedInput ? ` (cached ${usage.cachedInput})` : ''} · out ${usage.output} · total ${usage.total}`);
-  }
-
-  const normalized = normalizeUsagePayload(latestThreadUsageRaw);
-  if (normalized) {
-    const contextWindow = pickNumber(normalized, [
-      'contextWindowTokens',
-      'context_window_tokens',
-      'contextWindow',
-      'context_window',
-      'modelContextWindow',
-      'model_context_window',
-      'maxInputTokens',
-      'max_input_tokens',
-      'maxTokens',
-      'max_tokens'
-    ]);
-    if (contextWindow !== null) {
-      lines.push(`Context window: ${contextWindow}`);
-    }
-
-    const remaining = pickNumber(normalized, [
-      'remainingTokens',
-      'remaining_tokens',
-      'availableTokens',
-      'available_tokens',
-      'contextRemainingTokens',
-      'context_remaining_tokens'
-    ]);
-    if (remaining !== null) {
-      lines.push(`Remaining tokens: ${remaining}`);
-    }
-  }
-
-  return lines.join('\n');
-});
-
-type TurnSegment =
-  | { type: 'message'; id: string; entry: LogEntry }
-  | { type: 'plan_state'; id: string; text: string }
-  | { type: 'tech'; id: string; items: LogEntry[] };
-
-function turnGroupId(group: TurnGroup): string | null {
-  const startMeta = normalizeMeta(group.startEntry) as any;
-  if (typeof startMeta.turnId === 'string' && startMeta.turnId) return startMeta.turnId;
-  for (const item of group.items) {
-    const meta = normalizeMeta(item) as any;
-    if (typeof meta.turnId === 'string' && meta.turnId) return meta.turnId;
-  }
-  return null;
-}
-
-function turnSegments(group: TurnGroup): TurnSegment[] {
-  const result: TurnSegment[] = [];
-  let batch: LogEntry[] = [];
-  const turnId = turnGroupId(group);
-  const transientPlan = turnId ? latestTurnPlanTextByTurnId.value.get(turnId) : null;
-  const hasAuthoritativePlanItem = group.items.some((item) => normalizeMeta(item).itemType === 'plan');
-
-  const flushBatch = () => {
-    if (batch.length > 0) {
-      result.push({ type: 'tech', id: batch[0].id, items: batch });
-      batch = [];
-    }
-  };
-
-  if (transientPlan?.text.trim() && !hasAuthoritativePlanItem) {
-    result.push({ type: 'plan_state', id: `plan-state-${turnId}`, text: transientPlan.text.trim() });
-  }
-
-  for (const item of group.items) {
-    if (isHiddenItem(item)) continue;
-    if (normalizeMeta(item).itemType === 'agent_message') {
-      flushBatch();
-      result.push({ type: 'message', id: item.id, entry: item });
-    } else {
-      batch.push(item);
-    }
-  }
-  flushBatch();
-
-  return result;
-}
-
-const segmentExpansionOverrides = ref(new Map<string, boolean>());
-
-function hasDiffItem(entry: LogEntry): boolean {
-  const meta = normalizeMeta(entry);
-  if (meta.itemType === 'file_change' || meta.itemType === 'turn_diff') return true;
-  return itemPatch(entry) !== null;
-}
-
-function shouldCollapseTechSegment(items: LogEntry[]): boolean {
-  if (items.length === 0) return false;
-  const onlyReasoning = items.every((item) => normalizeMeta(item).itemType === 'reasoning');
-  if (onlyReasoning && items.length <= 2) return false;
-  return true;
-}
-
-function shouldAutoExpand(items: LogEntry[]): boolean {
-  return false;
-}
-
-function isExpanded(id: string, items: LogEntry[]): boolean {
-  const override = segmentExpansionOverrides.value.get(id);
-  if (override !== undefined) return override;
-  return shouldAutoExpand(items);
-}
-
-function toggleExpanded(id: string, items: LogEntry[]) {
-  const next = new Map(segmentExpansionOverrides.value);
-  next.set(id, !isExpanded(id, items));
-  segmentExpansionOverrides.value = next;
-}
-
-function itemLabel(item: LogEntry): string {
-  const meta = normalizeMeta(item);
-  const map: Record<string, string> = {
-    reasoning: 'think',
-    model_reroute: 'model',
-    command_execution: 'cmd',
-    file_change: 'file',
-    turn_diff: 'turn diff',
-    mcp_tool_call: 'tool',
-    collab_tool_call: 'tool',
-    web_search: 'web',
-    image_view: 'img',
-    entered_review_mode: 'review',
-    exited_review_mode: 'review',
-    context_compaction: 'compact',
-    plan: 'plan'
-  };
-  return map[meta.itemType ?? ''] ?? (meta.itemType ?? 'item');
-}
-
-function techSegmentSummary(items: LogEntry[]): string {
-  const counts = new Map<string, number>();
-  for (const item of items) {
-    const itemType = normalizeMeta(item).itemType ?? 'item';
-    counts.set(itemType, (counts.get(itemType) ?? 0) + 1);
-  }
-
-  const entries = [...counts.entries()];
-  const orderedKeys = [
-    'file_change',
-    'turn_diff',
-    'command_execution',
-    'reasoning',
-    'plan',
-    'permission_request',
-    'mcp_tool_call',
-    'collab_tool_call',
-    'web_search',
-    'image_view',
-    'entered_review_mode',
-    'exited_review_mode',
-    'context_compaction'
-  ];
-  entries.sort((a, b) => {
-    const aIdx = orderedKeys.indexOf(a[0]);
-    const bIdx = orderedKeys.indexOf(b[0]);
-    return (aIdx === -1 ? Number.MAX_SAFE_INTEGER : aIdx) - (bIdx === -1 ? Number.MAX_SAFE_INTEGER : bIdx);
-  });
-
-  const format = (count: number, singular: string, plural: string) => `${count} ${count === 1 ? singular : plural}`;
-  return entries
-    .map(([type, count]) => {
-      switch (type) {
-        case 'file_change':
-          return format(count, 'file edited', 'files edited');
-        case 'turn_diff':
-          return format(count, 'diff', 'diffs');
-        case 'command_execution':
-          return format(count, 'cmd', 'cmds');
-        case 'reasoning':
-          return format(count, 'thought', 'thoughts');
-        case 'plan':
-          return format(count, 'plan', 'plans');
-        case 'permission_request':
-          return format(count, 'approval', 'approvals');
-        case 'mcp_tool_call':
-        case 'collab_tool_call':
-          return format(count, 'tool call', 'tool calls');
-        case 'web_search':
-          return format(count, 'web action', 'web actions');
-        case 'image_view':
-          return format(count, 'image view', 'image views');
-        case 'entered_review_mode':
-        case 'exited_review_mode':
-          return format(count, 'review step', 'review steps');
-        case 'context_compaction':
-          return format(count, 'compaction', 'compactions');
-        default:
-          return format(count, type.replace(/_/g, ' '), `${type.replace(/_/g, ' ')}s`);
-      }
-    })
-    .slice(0, 3)
-    .join(' · ');
-}
-
-function itemBody(item: LogEntry): string {
-  const meta = normalizeMeta(item);
-  const text = bodyText(item);
-  if (meta.itemType === 'command_execution') {
-    const parsed = parseCommandExecutionText(text);
-    const sections: string[] = [];
-    if (parsed.output) sections.push(`output:\n${parsed.output}`);
-    if (parsed.stdout) sections.push(`stdout:\n${parsed.stdout}`);
-    if (parsed.stderr) sections.push(`stderr:\n${parsed.stderr}`);
-    const header = parsed.exit ? `${parsed.command}  [${parsed.exit}]` : parsed.command;
-    return sections.length > 0 ? `${header}\n${sections.join('\n\n')}` : header;
-  }
-  if (meta.itemType === 'reasoning') return text.replace(/\*\*/g, '');
-  return text;
-}
-
-function parseCommandExecutionText(text: string): ParsedCommandExecution {
-  const lines = text.split('\n');
-  const command = lines.find((l) => l.startsWith('command:'))?.replace('command:', '').trim() ?? text.trim();
-  const exit = lines.find((l) => l.startsWith('exit:'))?.replace('exit:', '').trim() ?? '';
-  const markerPrefixes = ['command:', 'exit:', 'stdout:', 'stderr:', 'output:', 'duration_ms:'];
-
-  const collectBlock = (marker: string): string => {
-    const start = lines.findIndex((line) => line.startsWith(marker));
-    if (start === -1) return '';
-    const out: string[] = [];
-    for (let i = start + 1; i < lines.length; i++) {
-      const line = lines[i];
-      if (markerPrefixes.some((prefix) => line.startsWith(prefix))) break;
-      out.push(line);
-    }
-    return out.join('\n').trim();
-  };
-
-  return {
-    command,
-    exit,
-    output: collectBlock('output:'),
-    stdout: collectBlock('stdout:'),
-    stderr: collectBlock('stderr:')
-  };
-}
-
-function itemCommandExecution(item: LogEntry): ParsedCommandExecution | null {
-  if (normalizeMeta(item).itemType !== 'command_execution') return null;
-  return parseCommandExecutionText(bodyText(item));
-}
-
-function itemTextClass(item: LogEntry): string {
-  const meta = normalizeMeta(item);
-  if (meta.itemType === 'reasoning') return 'text-neutral-500 italic';
-  if (meta.itemType === 'model_reroute') return 'text-amber-700';
-  if (meta.itemType === 'command_execution') return 'font-mono text-neutral-700';
-  if (meta.itemType === 'file_change') return 'font-mono text-teal-700';
-  if (meta.itemType === 'turn_diff') return 'font-mono text-sky-700';
-  return 'text-neutral-700';
-}
-
-function itemRowAlignClass(item: LogEntry): string {
-  const meta = normalizeMeta(item);
-  return meta.itemType === 'reasoning' ? 'items-center' : 'items-start';
-}
-
-function itemPatch(item: LogEntry): string | null {
-  const meta = normalizeMeta(item) as any;
-  if (meta.itemType === 'file_change' && typeof meta.turnId === 'string') {
-    const hasTurnLevelDiff = logEntries.value.some((entry) => {
-      const entryMeta = normalizeMeta(entry) as any;
-      return entryMeta.kind === 'codex.item' && entryMeta.itemType === 'turn_diff' && entryMeta.turnId === meta.turnId;
-    });
-    if (hasTurnLevelDiff) return null;
-  }
-
-  if (typeof item.rawPatch === 'string' && item.rawPatch.trim()) {
-    const candidate = item.rawPatch;
-    return hasPatchFileHeaders(candidate) ? candidate : null;
-  }
-
-  const text = itemRawBodyText(item);
-  const diffMarker = '\ndiff:\n';
-  const diffMarkerIndex = text.indexOf(diffMarker);
-  if (diffMarkerIndex >= 0) {
-    const candidate = text.slice(diffMarkerIndex + diffMarker.length).trim();
-    if (candidate) {
-      if (hasPatchFileHeaders(candidate)) return candidate;
-    }
-  }
-  const diffHeaderIndex = text.indexOf('diff --git');
-  if (diffHeaderIndex >= 0) return text.slice(diffHeaderIndex).trim();
-  const hunkIndex = text.indexOf('@@ ');
-  if (hunkIndex >= 0) return null;
-  return null;
-}
-
-function approvalPolicyForMode(mode: AccessMode): string {
-  return mode === 'full-access' ? 'never' : 'unlessTrusted';
-}
-
-function toggleMenu(menu: 'model' | 'effort' | 'access') {
-  openMenu.value = openMenu.value === menu ? null : menu;
-}
-
-function closeMenus() {
-  openMenu.value = null;
-}
-
-function restoreConflictedDraft() {
-  if (typeof conflictedEditorDraft.value !== 'string') return;
-  applyingRemoteEditorUpdate = true;
-  editorText.value = conflictedEditorDraft.value;
-  conflictedEditorDraft.value = null;
-  apiError.value = null;
-}
-
-function selectModelOption(optionId: string) {
-  selectedModel.value = optionId;
-  closeMenus();
-}
-
-function selectEffortOption(optionId: string) {
-  selectedEffort.value = optionId;
-  closeMenus();
-}
-
-function selectAccessMode(mode: AccessMode) {
-  accessMode.value = mode;
-  closeMenus();
-}
-
-function sandboxModeForMode(mode: AccessMode): string {
-  return mode === 'full-access' ? 'danger-full-access' : 'workspace-write';
-}
-
-function sandboxPolicyForMode(mode: AccessMode): Record<string, unknown> {
-  if (mode === 'full-access') {
-    return { type: 'dangerFullAccess' };
-  }
-
-  return {
-    type: 'workspaceWrite',
-    ...(workingDirectory.value ? { writableRoots: [workingDirectory.value] } : {}),
-    networkAccess: true
-  };
 }
 
 function startWorkingTimer(startedAtIso?: string) {
@@ -1877,7 +496,7 @@ function startWorkingTimer(startedAtIso?: string) {
   }, 1000);
 }
 
-function stopWorkingTimer(endedAtIso?: string) {
+function stopWorkingTimer(_endedAtIso?: string) {
   activeTaskStartedAt.value = null;
   running.value = false;
 
@@ -1896,17 +515,6 @@ function addTimelineEntry(entry: TimelineEntry) {
     at: entry.at,
     meta: entry.meta
   });
-}
-
-function timelineEntryKind(entry: TimelineEntry): TimelineEntry['meta']['kind'] | null {
-  if (entry.meta?.kind) return entry.meta.kind;
-  if (entry.side === 'left') return 'user.message';
-  if (entry.text.startsWith('Started:')) return 'codex.started';
-  if (entry.text.startsWith('Turn completed')) return 'codex.completed';
-  if (entry.text.startsWith('Turn interrupted')) return 'codex.interrupted';
-  if (entry.text.startsWith('Error:')) return 'codex.failed';
-  if (entry.text.startsWith('Item:')) return 'codex.item';
-  return null;
 }
 
 async function codexRpc(method: string, params?: unknown): Promise<any> {
@@ -1951,9 +559,10 @@ function promptForOptionSelection(
     '',
     ...options.map((option, index) => {
       const label = typeof option?.label === 'string' ? option.label : `Option ${index + 1}`;
-      const description = typeof option?.description === 'string' && option.description.trim()
-        ? ` — ${option.description.trim()}`
-        : '';
+      const description =
+        typeof option?.description === 'string' && option.description.trim()
+          ? ` — ${option.description.trim()}`
+          : '';
       return `${index + 1}. ${label}${description}`;
     }),
     allowOther ? '' : '',
@@ -2092,48 +701,6 @@ async function respondToMcpServerElicitation(requestId: number | string, params:
   }
 }
 
-function readPromptFromTurn(turn: any): string {
-  const items = Array.isArray(turn?.items) ? turn.items : [];
-  for (const item of items) {
-    if (!item || typeof item !== 'object') continue;
-    const type = normalizeCodexItemType(item.type);
-    if (type !== 'user_message') continue;
-    const content = Array.isArray((item as any).content) ? (item as any).content : [];
-    const texts = content
-      .map((entry: any) => (entry?.type === 'text' && typeof entry?.text === 'string' ? entry.text : ''))
-      .filter(Boolean);
-    if (texts.length > 0) return texts.join('\n').trim();
-  }
-  const input = Array.isArray(turn?.input) ? turn.input : [];
-  const texts = input
-    .map((entry: any) => (entry?.type === 'text' && typeof entry?.text === 'string' ? entry.text : ''))
-    .filter(Boolean);
-  return texts.join('\n').trim();
-}
-
-function readFinalResponseFromTurn(turn: any): string {
-  if (typeof turn?.finalResponse === 'string') return turn.finalResponse;
-  const items = Array.isArray(turn?.items) ? turn.items : [];
-  for (let i = items.length - 1; i >= 0; i--) {
-    const item = items[i];
-    if (!item || typeof item !== 'object') continue;
-    const type = normalizeCodexItemType(item.type);
-    if (type !== 'agent_message') continue;
-    return extractCodexAgentMessageText(item);
-  }
-  return '';
-}
-
-function codexTurnIdFromValue(value: any): string | null {
-  return (
-    (typeof value?.turnId === 'string' && value.turnId) ||
-    (typeof value?.turn_id === 'string' && value.turn_id) ||
-    (typeof value?.turn?.id === 'string' && value.turn.id) ||
-    activeCodexTurnId ||
-    null
-  );
-}
-
 function replayTurnsFromThreadRead(thread: any) {
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
   for (const turn of turns) {
@@ -2205,13 +772,9 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const msg = params?.msg ?? {};
     const rawType = typeof msg?.type === 'string' ? msg.type : '';
 
-    // Compatibility fallback: stable clients should rely on thread/tokenUsage/updated.
-    // Keep legacy token_count support because upstream/raw payloads may still surface it
-    // during reconnects or mixed-version environments, and future experimental opt-ins may
-    // temporarily expose the raw family again.
     if (rawType === 'token_count') {
       if (msg?.info && typeof msg.info === 'object') {
-        latestThreadUsageRaw = {
+    latestThreadUsageRaw.value = {
           total: {
             totalTokens: (msg.info as any)?.total_token_usage?.total_tokens,
             inputTokens: (msg.info as any)?.total_token_usage?.input_tokens,
@@ -2228,7 +791,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
           },
           modelContextWindow: (msg.info as any)?.model_context_window
         };
-        latestUsageFromEvent.value = usageFromEvent(latestThreadUsageRaw);
+        latestUsageFromEvent.value = usageFromEvent(latestThreadUsageRaw.value);
       }
       return;
     }
@@ -2261,8 +824,8 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   }
 
   if (method === 'thread/tokenUsage/updated') {
-    latestThreadUsageRaw = extractCodexUsagePayload(params) ?? params;
-    latestUsageFromEvent.value = usageFromEvent(latestThreadUsageRaw);
+    latestThreadUsageRaw.value = extractCodexUsagePayload(params) ?? params;
+    latestUsageFromEvent.value = usageFromEvent(latestThreadUsageRaw.value);
     return;
   }
 
@@ -2276,7 +839,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
           ? turn.reasoningEffort
           : undefined;
     if (typeof turn?.id === 'string') activeCodexTurnId = turn.id;
-    latestThreadUsageRaw = null;
+    latestThreadUsageRaw.value = null;
     latestUsageFromEvent.value = null;
     syncComposerDefaults(turnModel, turnEffort);
     if (!running.value) {
@@ -2301,7 +864,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       : { type: 'unknown' }) as Record<string, unknown>;
     const itemId = codexItemIdFrom(item);
     if (itemId) liveCodexItemState.set(itemId, item);
-    const turnId = codexTurnIdFromValue(params);
+    const turnId = codexTurnIdFromValue(params, activeCodexTurnId);
     if (shouldRenderStartedItem(codexItemTypeForUi(item))) {
       upsertCodexItemTimeline(item, at, { turnId, itemId });
     }
@@ -2316,7 +879,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'agent_message' };
     appendCodexTextField(state, 'text', delta);
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2328,7 +891,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'plan' };
     appendCodexTextField(state, 'text', delta);
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2342,7 +905,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     appendCodexTextField(summary, 'text', delta);
     state.summary = summary;
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2358,7 +921,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     }
     state.summary = summary;
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2372,7 +935,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     appendCodexTextField(content, 'text', delta);
     state.content = content;
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2384,7 +947,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'command_execution' };
     appendCodexTextField(state, 'aggregatedOutput', delta);
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2396,7 +959,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const state = liveCodexItemState.get(itemId) ?? { id: itemId, type: 'file_change' };
     appendCodexTextField(state, 'outputDelta', delta);
     liveCodexItemState.set(itemId, state);
-    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params), itemId });
+    upsertCodexItemTimeline(state, at, { turnId: codexTurnIdFromValue(params, activeCodexTurnId), itemId });
     return;
   }
 
@@ -2409,7 +972,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
     const base = itemId ? liveCodexItemState.get(itemId) : undefined;
     const merged = base ? ({ ...base, ...item } as Record<string, unknown>) : item;
     if (itemId) liveCodexItemState.delete(itemId);
-    const turnId = codexTurnIdFromValue(params);
+    const turnId = codexTurnIdFromValue(params, activeCodexTurnId);
     if (codexItemTypeForUi(merged) === 'plan' && turnId) {
       const next = new Map(latestTurnPlanTextByTurnId.value);
       next.delete(turnId);
@@ -2425,9 +988,6 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
   if (method === 'turn/diff/updated') {
     ensureLiveTurnStarted();
     const turnId = typeof params?.turnId === 'string' ? params.turnId : null;
-    // Stable docs describe { diff }, but some mixed-version servers still expose
-    // diffPreview/diffLength on this notification. Prefer the documented field and
-    // keep the preview fallback so turn-level diff UI does not disappear mid-upgrade.
     const patch =
       typeof params?.diff === 'string'
         ? params.diff
@@ -2448,7 +1008,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       const status = typeof entry?.status === 'string' ? entry.status : 'pending';
       return `${i + 1}. [${status}] ${step}`;
     });
-    const turnId = codexTurnIdFromValue(params);
+    const turnId = codexTurnIdFromValue(params, activeCodexTurnId);
     if (!turnId) return;
     latestTurnPlanTextByTurnId.value = new Map(latestTurnPlanTextByTurnId.value).set(turnId, {
       text: [explanation, ...lines].filter(Boolean).join('\n'),
@@ -2496,7 +1056,7 @@ function applyCodexNotification(message: CodexRpcMessage, at: string) {
       finalResponse:
         (typeof turn?.finalResponse === 'string' ? turn.finalResponse : '') ||
         '',
-      usage: extractCodexUsagePayload(turn) ?? latestThreadUsageRaw
+      usage: extractCodexUsagePayload(turn) ?? latestThreadUsageRaw.value
     });
   }
 }
@@ -2562,29 +1122,6 @@ async function handleCodexServerRequest(message: CodexRpcMessage) {
     error: { code: -32601, message: `Unsupported server-initiated request: ${method || 'unknown'}` }
   });
 }
-
-function isTimelineNearBottom(thresholdPx = 48): boolean {
-  const el = timelineEl.value;
-  if (!el) return true;
-  const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-  return distanceToBottom <= thresholdPx;
-}
-
-function onTimelineScroll() {
-  shouldAutoScrollTimeline.value = isTimelineNearBottom();
-}
-
-async function scrollToBottom(force = false) {
-  await nextTick();
-  const el = timelineEl.value;
-  if (!el) return;
-  if (!force && !shouldAutoScrollTimeline.value) return;
-  el.scrollTop = el.scrollHeight;
-}
-
-watch(logEntries, () => {
-  void scrollToBottom(false);
-});
 
 async function loadState() {
   const response = await apiFetch(`/api/rooms/${roomId.value}/state`);
@@ -2681,9 +1218,6 @@ async function loadModels() {
       .map((entry: any) => {
         const id = typeof entry?.id === 'string' ? entry.id : '';
         if (!id) return null;
-        // Prefer the current stable supportedReasoningEfforts payload.
-        // Keep the older reasoningEffort shape as a compatibility shim so future
-        // experimental or mixed-version servers do not blank the picker.
         const effortOptions = parseModelEffortOptions(entry) as EffortOption[];
         return {
           id,
@@ -2748,9 +1282,8 @@ async function switchRoom(nextRoomId: string) {
   view.value = 'chat';
   await loadState();
   await loadModels();
-  shouldAutoScrollTimeline.value = true;
   connectEvents();
-  scrollToBottom(true);
+  await timelineViewEl.value?.scrollToBottom(true);
 }
 
 function goHome() {
@@ -2845,22 +1378,14 @@ function connectEvents() {
               }
 
               switch (event.type) {
-                case 'timeline.entry':
-                  {
-                    const kind = timelineEntryKind(event.entry);
-                    if (kind !== 'user.message') {
-                      break;
-                    }
-                    addTimelineEntry(event.entry);
-                    if (kind === 'codex.started') {
-                      running.value = true;
-                      startWorkingTimer(event.entry.at);
-                    }
-                    if (kind === 'codex.completed' || kind === 'codex.failed' || kind === 'codex.interrupted') {
-                      stopWorkingTimer(event.entry.at);
-                    }
+                case 'timeline.entry': {
+                  const kind = timelineEntryKind(event.entry);
+                  if (kind !== 'user.message') {
+                    break;
                   }
+                  addTimelineEntry(event.entry);
                   break;
+                }
                 case 'editor.updated':
                   editorVersion.value =
                     typeof event.editor.version === 'number' ? event.editor.version : editorVersion.value;
@@ -2916,11 +1441,11 @@ function connectEvents() {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   };
+
   void read();
 }
 
 async function syncEditor() {
-  const el = editorEl.value;
   try {
     const response = await apiFetch(`/api/rooms/${roomId.value}/editor`, {
       method: 'POST',
@@ -2930,8 +1455,8 @@ async function syncEditor() {
         userName: userName.value,
         text: editorText.value,
         baseVersion: editorVersion.value,
-        selectionStart: el?.selectionStart ?? editorText.value.length,
-        selectionEnd: el?.selectionEnd ?? editorText.value.length
+        selectionStart: editorEl.value?.selectionStart ?? editorText.value.length,
+        selectionEnd: editorEl.value?.selectionEnd ?? editorText.value.length
       })
     });
     if (response.status === 409) {
@@ -2981,9 +1506,13 @@ watch(editorText, () => {
   scheduleEditorSync(120);
 });
 
-watch(editorCursors, () => {
-  refreshCursorOverlays();
-}, { deep: true });
+watch(
+  editorCursors,
+  () => {
+    refreshCursorOverlays();
+  },
+  { deep: true }
+);
 
 function onEditorSelectionChange() {
   refreshCursorOverlays();
@@ -2994,14 +1523,108 @@ function onEditorScroll() {
   refreshCursorOverlays();
 }
 
-function onWindowPointerDown(event: PointerEvent) {
-  const target = event.target;
-  if (!(target instanceof Node)) return;
-  if (modelMenuEl.value?.contains(target)) return;
-  if (effortMenuEl.value?.contains(target)) return;
-  if (accessMenuEl.value?.contains(target)) return;
-  closeMenus();
+function setEditorEl(el: Element | null) {
+  editorEl.value = el as HTMLTextAreaElement | null;
 }
+
+function restoreConflictedDraft() {
+  if (typeof conflictedEditorDraft.value !== 'string') return;
+  applyingRemoteEditorUpdate = true;
+  editorText.value = conflictedEditorDraft.value;
+  conflictedEditorDraft.value = null;
+  apiError.value = null;
+}
+
+function selectModelOption(optionId: string) {
+  selectedModel.value = optionId;
+}
+
+function selectEffortOption(optionId: string) {
+  selectedEffort.value = optionId;
+}
+
+function selectAccessMode(mode: AccessMode) {
+  accessMode.value = mode;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickNumber(obj: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const n = toFiniteNumber(obj[key]);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+const latestContextAvailablePercent = computed(() => {
+  const fromLiveUsage = usageFromEvent(latestThreadUsageRaw.value)?.contextAvailablePercent;
+  if (fromLiveUsage !== undefined) return fromLiveUsage;
+  for (let i = logEntries.value.length - 1; i >= 0; i -= 1) {
+    const entry = logEntries.value[i];
+    if (getEntryKind(entry) !== 'codex.completed') continue;
+    const replayUsage = usageByTurnAt.value.get(entry.at)?.contextAvailablePercent;
+    if (typeof replayUsage === 'number') return replayUsage;
+  }
+  return null;
+});
+
+const contextAvailabilityText = computed(() => {
+  if (latestUsageFromEvent.value?.contextAvailablePercent !== undefined) {
+    return `Context available: ${latestUsageFromEvent.value.contextAvailablePercent}%`;
+  }
+  if (running.value) {
+    return 'Context available: --%';
+  }
+  if (latestContextAvailablePercent.value !== null) {
+    return `Context available: ${latestContextAvailablePercent.value}%`;
+  }
+  return 'Context available: --%';
+});
+
+const contextAvailabilityTitle = computed(() => {
+  const lines = [contextAvailabilityText.value];
+  const usage = latestUsageFromEvent.value;
+  if (usage) {
+    lines.push(`Tokens: in ${usage.input}${usage.cachedInput ? ` (cached ${usage.cachedInput})` : ''} · out ${usage.output} · total ${usage.total}`);
+  }
+
+  const normalized = normalizeUsagePayload(latestThreadUsageRaw.value);
+  if (normalized) {
+    const contextWindow = pickNumber(normalized, [
+      'contextWindowTokens',
+      'context_window_tokens',
+      'contextWindow',
+      'context_window',
+      'modelContextWindow',
+      'model_context_window',
+      'maxInputTokens',
+      'max_input_tokens',
+      'maxTokens',
+      'max_tokens'
+    ]);
+    if (contextWindow !== null) {
+      lines.push(`Context window: ${contextWindow}`);
+    }
+
+    const remaining = pickNumber(normalized, [
+      'remainingTokens',
+      'remaining_tokens',
+      'availableTokens',
+      'available_tokens',
+      'contextRemainingTokens',
+      'context_remaining_tokens'
+    ]);
+    if (remaining !== null) {
+      lines.push(`Remaining tokens: ${remaining}`);
+    }
+  }
+
+  return lines.join('\n');
+});
 
 async function runCodex() {
   if (!canRun.value) return false;
@@ -3033,7 +1656,7 @@ async function runCodex() {
     ...(selectedModel.value !== 'default' ? { model: selectedModel.value } : {}),
     ...(selectedEffort.value ? { effort: selectedEffort.value } : {}),
     approvalPolicy: approvalPolicyForMode(accessMode.value),
-    sandboxPolicy: sandboxPolicyForMode(accessMode.value)
+    sandboxPolicy: sandboxPolicyForMode(accessMode.value, workingDirectory.value)
   });
   activeCodexTurnId = typeof result?.turn?.id === 'string' ? result.turn.id : activeCodexTurnId;
   editorText.value = '';
@@ -3098,7 +1721,6 @@ function onEditorKeydown(event: KeyboardEvent) {
 
 onMounted(async () => {
   window.addEventListener('resize', refreshCursorOverlays);
-  window.addEventListener('pointerdown', onWindowPointerDown);
   try {
     await loadRuntime();
     await loadCodexThreads();
@@ -3112,9 +1734,8 @@ onMounted(async () => {
       }
       await loadState();
       await loadModels();
-      shouldAutoScrollTimeline.value = true;
       connectEvents();
-      scrollToBottom(true);
+      await timelineViewEl.value?.scrollToBottom(true);
       await nextTick();
       refreshCursorOverlays();
     }
@@ -3126,7 +1747,6 @@ onMounted(async () => {
 onUnmounted(() => {
   eventsAbortController?.abort();
   window.removeEventListener('resize', refreshCursorOverlays);
-  window.removeEventListener('pointerdown', onWindowPointerDown);
   if (workingTimer) {
     window.clearInterval(workingTimer);
     workingTimer = null;
@@ -3135,635 +1755,84 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex flex-col h-dvh max-w-[720px] mx-auto">
+  <div class="mx-auto flex h-dvh max-w-[720px] flex-col">
+    <CodexHeaderBar
+      :view="view"
+      :running="running"
+      :room-id="roomId"
+      :short-room-id="shortRoomId"
+      :working-directory="workingDirectory"
+      :debug-copy-status="debugCopyStatus"
+      :user-name="userName"
+      @go-home="goHome"
+      @copy-debug="copyDebugInfo"
+    />
 
-    <!-- Header -->
-    <header class="shrink-0 sticky top-0 z-10 border-b border-neutral-200 bg-white/90 backdrop-blur-sm">
-      <div class="flex items-center justify-between px-5 py-3">
-        <div class="flex items-center gap-2">
-          <button
-            v-if="view === 'chat'"
-            type="button"
-            class="rounded-md border border-neutral-200 px-2 py-0.5 text-[11px] text-neutral-600 hover:bg-neutral-100"
-            @click="goHome"
-          >
-            ← Chats
-          </button>
-          <span
-            class="size-[7px] rounded-full transition-colors"
-            :class="running ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'"
-          ></span>
-          <span class="text-[13px] font-medium tracking-tight text-neutral-900">
-            <span v-if="view === 'chat'" :title="roomId">{{ shortId(roomId) }}</span>
-            <span v-else>Rooms</span>
-          </span>
-          <span
-            v-if="workingDirectory && view === 'chat'"
-            class="max-w-[360px] truncate text-[11px] text-neutral-400"
-            :title="workingDirectory"
-          >
-            {{ workingDirectory }}
-          </span>
-        </div>
-        <div class="flex items-center gap-2">
-          <button
-            v-if="view === 'chat'"
-            type="button"
-            class="inline-flex size-6 items-center justify-center rounded-md border border-neutral-200 text-[12px] text-neutral-600 hover:bg-neutral-100"
-            :title="debugCopyStatus === 'copied' ? 'Copied debug info' : debugCopyStatus === 'error' ? 'Copy debug failed' : 'Copy debug info'"
-            aria-label="Copy debug info"
-            @click="copyDebugInfo"
-          >
-            {{ debugCopyStatus === 'copied' ? '✓' : debugCopyStatus === 'error' ? '!' : '⧉' }}
-          </button>
-          <span class="max-w-[180px] truncate text-xs text-neutral-400" :title="userName">{{ userName }}</span>
-        </div>
-      </div>
-    </header>
-
-    <div
+    <CodexErrorBanner
       v-if="apiError"
-      class="shrink-0 border-b border-amber-200 bg-amber-50 px-5 py-2 text-[12px] text-amber-800"
-    >
-      <div class="flex items-center justify-between gap-3">
-        <span>{{ apiError }}</span>
-        <button
-          v-if="conflictedEditorDraft"
-          type="button"
-          class="shrink-0 rounded-md border border-amber-300 px-2 py-1 text-[11px] font-medium text-amber-900 hover:bg-amber-100"
-          @click="restoreConflictedDraft"
-        >
-          Restore draft
-        </button>
-      </div>
-    </div>
+      :api-error="apiError"
+      :has-conflicted-draft="Boolean(conflictedEditorDraft)"
+      @restore-draft="restoreConflictedDraft"
+    />
 
-    <section
+    <CodexApprovalPanel
       v-if="pendingApproval"
-      class="shrink-0 border-b border-orange-200 bg-orange-50 px-5 py-3"
-    >
-      <div class="rounded-xl border border-orange-200 bg-white p-3">
-        <div class="flex items-start justify-between gap-3">
-          <div class="min-w-0">
-            <p class="text-[11px] font-semibold uppercase tracking-wide text-orange-500">Approval Needed</p>
-            <p class="mt-1 text-sm font-medium text-neutral-900">{{ pendingApproval.title }}</p>
-            <p v-if="pendingApproval.reason" class="mt-1 whitespace-pre-wrap text-[12px] text-neutral-600">{{ pendingApproval.reason }}</p>
-          </div>
-        </div>
+      :pending-approval="pendingApproval"
+      @resolve="resolvePendingApproval"
+    />
 
-        <div v-if="pendingApproval.command" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
-          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">command</div>
-          <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ pendingApproval.command }}</pre>
-        </div>
-
-        <div v-if="pendingApproval.files && pendingApproval.files.length" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
-          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">files</div>
-          <div class="px-2 py-1.5 text-[11px] leading-relaxed text-neutral-700">
-            <div v-for="file in pendingApproval.files" :key="file">{{ file }}</div>
-          </div>
-        </div>
-
-        <div v-if="pendingApproval.patch" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
-          <DiffPatch :patch="pendingApproval.patch" />
-        </div>
-
-        <div class="mt-3 flex flex-wrap gap-2">
-          <button
-            v-for="decision in pendingApproval.decisions"
-            :key="decision"
-            type="button"
-            class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
-            @click="resolvePendingApproval(decision)"
-          >
-            {{ approvalDecisionLabel(decision) }}
-          </button>
-        </div>
-      </div>
-    </section>
-
-    <section
+    <CodexPermissionsPanel
       v-if="pendingPermissionsRequest"
-      class="shrink-0 border-b border-teal-200 bg-teal-50 px-5 py-3"
-    >
-      <div class="rounded-xl border border-teal-200 bg-white p-3">
-        <p class="text-[11px] font-semibold uppercase tracking-wide text-teal-600">Permissions Request</p>
-        <p class="mt-1 text-sm font-medium text-neutral-900">
-          {{ pendingPermissionsRequest.reason || 'Codex requests additional permissions for this turn.' }}
-        </p>
+      :pending-permissions-request="pendingPermissionsRequest"
+      @resolve="resolvePendingPermissions"
+    />
 
-        <div v-if="pendingPermissionsRequest.requestedWriteRoots.length" class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
-          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">write roots</div>
-          <div class="space-y-2 px-2 py-2">
-            <label
-              v-for="root in pendingPermissionsRequest.requestedWriteRoots"
-              :key="root"
-              class="flex items-start gap-2 text-[12px] text-neutral-700"
-            >
-              <input
-                v-model="pendingPermissionsRequest.selectedWriteRoots"
-                type="checkbox"
-                :value="root"
-                class="mt-0.5"
-              >
-              <span class="break-all">{{ root }}</span>
-            </label>
-          </div>
-        </div>
+    <CodexHomeView
+      v-if="view === 'home'"
+      :codex-threads="codexThreads"
+      @open-new-room="openNewRoom"
+      @open-thread="openCodexThread"
+    />
 
-        <div class="mt-3 overflow-hidden rounded border border-neutral-200 bg-white">
-          <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">requested permissions</div>
-          <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ JSON.stringify(pendingPermissionsRequest.permissions, null, 2) }}</pre>
-        </div>
+    <template v-else>
+      <CodexTimelineView
+        ref="timelineViewEl"
+        :room-id="roomId"
+        :log-entries="logEntries"
+        :running="running"
+        :working-seconds="workingSeconds"
+        :usage-by-turn-at="usageByTurnAt"
+        :latest-usage-from-event="latestUsageFromEvent"
+        :latest-thread-usage-raw="latestThreadUsageRaw"
+        :latest-turn-plan-text-by-turn-id="latestTurnPlanTextByTurnId"
+      />
 
-        <div class="mt-3 flex flex-wrap gap-2">
-          <button
-            type="button"
-            class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
-            @click="resolvePendingPermissions({ action: 'grant', scope: 'turn', grantedWriteRoots: [...pendingPermissionsRequest.selectedWriteRoots] })"
-          >
-            Grant For Turn
-          </button>
-          <button
-            type="button"
-            class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
-            @click="resolvePendingPermissions({ action: 'grant', scope: 'session', grantedWriteRoots: [...pendingPermissionsRequest.selectedWriteRoots] })"
-          >
-            Grant For Session
-          </button>
-          <button
-            type="button"
-            class="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-white px-3 py-1.5 text-xs font-medium text-rose-700 transition-colors hover:bg-rose-50"
-            @click="resolvePendingPermissions({ action: 'decline' })"
-          >
-            Decline
-          </button>
-        </div>
-      </div>
-    </section>
-
-    <section v-if="view === 'home'" class="flex-1 overflow-y-auto">
-      <div class="px-5 py-5 space-y-3">
-        <div class="rounded-xl border border-neutral-200 bg-white p-3">
-          <button
-            type="button"
-            class="rounded-lg bg-neutral-900 px-3 py-2 text-xs font-medium text-white hover:opacity-80"
-            @click="openNewRoom"
-          >
-            New session
-          </button>
-        </div>
-
-        <div class="space-y-2">
-          <p class="text-[11px] uppercase tracking-wide text-neutral-400">Codex sessions</p>
-          <button
-            v-for="thread in codexThreads"
-            :key="thread.id"
-            type="button"
-            class="flex w-full items-center justify-between rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left hover:bg-neutral-50"
-            @click="openCodexThread(thread.id)"
-          >
-            <span class="min-w-0">
-              <span class="block truncate text-[13px] text-neutral-800">{{ thread.preview || thread.id }}</span>
-              <span class="flex items-center gap-2 text-[11px] text-neutral-400">
-                <span class="truncate">{{ thread.id }}</span>
-                <span
-                  v-if="thread.source"
-                  class="shrink-0 rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 uppercase tracking-wide text-[10px] text-neutral-500"
-                >
-                  {{ thread.source }}
-                </span>
-              </span>
-            </span>
-            <span class="ml-3 shrink-0 text-[11px] text-neutral-400">
-              {{ formatThreadTime(thread.updatedAt ?? thread.createdAt) }}
-            </span>
-          </button>
-          <p v-if="codexThreads.length === 0" class="text-sm text-neutral-400">No Codex sessions found.</p>
-        </div>
-      </div>
-    </section>
-
-    <!-- Timeline -->
-    <section v-else class="flex-1 overflow-y-auto" ref="timelineEl" @scroll.passive="onTimelineScroll">
-      <div class="flex flex-col gap-3 px-5 py-5">
-
-        <div v-if="groups.length === 0" class="py-10 text-sm text-neutral-500">
-          <p class="mb-3">No messages yet in `{{ roomId }}`.</p>
-        </div>
-
-        <template v-for="group in groups" :key="group.id">
-
-          <!-- User message -->
-          <div v-if="group.type === 'message'" class="flex justify-start">
-            <div class="max-w-[78%] rounded-xl bg-neutral-200 px-4 py-3">
-              <pre class="m-0 whitespace-pre-wrap font-sans text-sm leading-relaxed text-neutral-900">{{ group.entry.text }}</pre>
-            </div>
-          </div>
-
-          <!-- Codex turn -->
-          <div v-else class="overflow-hidden rounded-xl border border-neutral-300 bg-white">
-
-            <!-- Turn header -->
-            <div class="flex items-center gap-2.5 border-b border-neutral-200 px-4 py-2.5">
-              <span class="size-[6px] shrink-0 rounded-full" :class="turnStatusClass(group)"></span>
-              <span class="flex-1 truncate text-[12.5px] font-medium text-neutral-700">{{ turnPrompt(group) }}</span>
-              <span
-                class="shrink-0 cursor-help text-[11px] text-neutral-500"
-                :title="turnMetaTitle(group)"
-              >{{ turnMeta(group) }}</span>
-            </div>
-
-            <!-- Segments: agent messages + collapsible tech groups in order -->
-            <div class="divide-y divide-neutral-200">
-              <template v-for="seg in turnSegments(group)" :key="seg.id">
-
-                <!-- Agent message — always visible -->
-                <div v-if="seg.type === 'message'" class="px-4 py-3">
-                  <div
-                    class="markdown-body text-sm leading-relaxed text-neutral-900"
-                    v-html="renderMarkdown(bodyText(seg.entry))"
-                  ></div>
-                </div>
-
-                <div v-else-if="seg.type === 'plan_state'" class="bg-neutral-50 px-4 py-3">
-                  <div class="flex gap-3 items-start">
-                    <span class="w-9 shrink-0 pt-0.5 text-right text-[9px] font-semibold uppercase tracking-wide text-neutral-400">
-                      plan
-                    </span>
-                    <pre class="m-0 whitespace-pre-wrap text-[12px] leading-relaxed text-neutral-600">{{ seg.text }}</pre>
-                  </div>
-                </div>
-
-                <!-- Tech group -->
-                <div v-else>
-                  <div
-                    v-if="!shouldCollapseTechSegment(seg.items)"
-                    class="bg-neutral-100"
-                  >
-                    <div
-                      v-for="item in seg.items"
-                      :key="item.id"
-                      class="flex gap-3 border-b border-neutral-200 px-4 py-2 last:border-0"
-                      :class="itemRowAlignClass(item)"
-                    >
-                      <span class="w-9 shrink-0 text-right text-[9px] font-semibold uppercase tracking-wide text-neutral-400">
-                        {{ itemLabel(item) }}
-                      </span>
-                      <div class="flex-1">
-                        <DiffPatch
-                          v-if="(normalizeMeta(item).itemType === 'file_change' || normalizeMeta(item).itemType === 'turn_diff') && itemPatch(item)"
-                          :patch="itemPatch(item) || ''"
-                        />
-                        <div
-                          v-else-if="normalizeMeta(item).itemType === 'command_execution' && itemCommandExecution(item)"
-                          class="space-y-2"
-                        >
-                          <div class="flex flex-wrap items-center gap-2 rounded border border-neutral-200 bg-white px-2 py-1.5">
-                            <span class="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">command</span>
-                            <code class="min-w-0 flex-1 break-all font-mono text-[11px] text-neutral-800">{{ itemCommandExecution(item)?.command }}</code>
-                            <span
-                              v-if="itemCommandExecution(item)?.exit"
-                              class="rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 font-mono text-[10px] text-neutral-600"
-                            >exit {{ itemCommandExecution(item)?.exit }}</span>
-                          </div>
-
-                          <div v-if="itemCommandExecution(item)?.output" class="overflow-hidden rounded border border-neutral-200 bg-white">
-                            <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">output</div>
-                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ itemCommandExecution(item)?.output }}</pre>
-                          </div>
-
-                          <div v-if="itemCommandExecution(item)?.stdout" class="overflow-hidden rounded border border-neutral-200 bg-white">
-                            <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">stdout</div>
-                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ itemCommandExecution(item)?.stdout }}</pre>
-                          </div>
-
-                          <div v-if="itemCommandExecution(item)?.stderr" class="overflow-hidden rounded border border-rose-200 bg-white">
-                            <div class="border-b border-rose-200 bg-rose-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-rose-600">stderr</div>
-                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-rose-700">{{ itemCommandExecution(item)?.stderr }}</pre>
-                          </div>
-                        </div>
-                        <pre
-                          v-else
-                          class="m-0 whitespace-pre-wrap text-[12px] leading-relaxed"
-                          :class="itemTextClass(item)"
-                        >{{ itemBody(item) }}</pre>
-                      </div>
-                    </div>
-                  </div>
-
-                  <template v-else>
-                  <button
-                    class="flex w-full items-center gap-2 bg-neutral-100 px-4 py-2 text-left transition-colors hover:bg-neutral-200"
-                    @click="toggleExpanded(seg.id, seg.items)"
-                  >
-                    <span class="text-[10px] text-neutral-400">{{ isExpanded(seg.id, seg.items) ? '▾' : '▸' }}</span>
-                    <span class="text-[11px] font-medium text-neutral-500">
-                      {{ isExpanded(seg.id, seg.items) ? `hide ${seg.items.length} step${seg.items.length > 1 ? 's' : ''}` : `${seg.items.length} step${seg.items.length > 1 ? 's' : ''}` }}
-                    </span>
-                    <span
-                      v-if="!isExpanded(seg.id, seg.items)"
-                      class="min-w-0 truncate text-[11px] text-neutral-400"
-                    >
-                      {{ techSegmentSummary(seg.items) }}
-                    </span>
-                  </button>
-
-                  <div v-if="isExpanded(seg.id, seg.items)" class="border-t border-neutral-200 bg-neutral-100">
-                    <div
-                      v-for="item in seg.items"
-                      :key="item.id"
-                      class="flex gap-3 border-b border-neutral-200 px-4 py-2 last:border-0"
-                      :class="itemRowAlignClass(item)"
-                    >
-                      <span class="w-9 shrink-0 text-right text-[9px] font-semibold uppercase tracking-wide text-neutral-400">
-                        {{ itemLabel(item) }}
-                      </span>
-                      <div class="flex-1">
-                        <DiffPatch
-                          v-if="(normalizeMeta(item).itemType === 'file_change' || normalizeMeta(item).itemType === 'turn_diff') && itemPatch(item)"
-                          :patch="itemPatch(item) || ''"
-                        />
-                        <div
-                          v-else-if="normalizeMeta(item).itemType === 'command_execution' && itemCommandExecution(item)"
-                          class="space-y-2"
-                        >
-                          <div class="flex flex-wrap items-center gap-2 rounded border border-neutral-200 bg-white px-2 py-1.5">
-                            <span class="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">command</span>
-                            <code class="min-w-0 flex-1 break-all font-mono text-[11px] text-neutral-800">{{ itemCommandExecution(item)?.command }}</code>
-                            <span
-                              v-if="itemCommandExecution(item)?.exit"
-                              class="rounded border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 font-mono text-[10px] text-neutral-600"
-                            >exit {{ itemCommandExecution(item)?.exit }}</span>
-                          </div>
-
-                          <div v-if="itemCommandExecution(item)?.output" class="overflow-hidden rounded border border-neutral-200 bg-white">
-                            <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">output</div>
-                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ itemCommandExecution(item)?.output }}</pre>
-                          </div>
-
-                          <div v-if="itemCommandExecution(item)?.stdout" class="overflow-hidden rounded border border-neutral-200 bg-white">
-                            <div class="border-b border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-neutral-500">stdout</div>
-                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-neutral-700">{{ itemCommandExecution(item)?.stdout }}</pre>
-                          </div>
-
-                          <div v-if="itemCommandExecution(item)?.stderr" class="overflow-hidden rounded border border-rose-200 bg-white">
-                            <div class="border-b border-rose-200 bg-rose-50 px-2 py-1 font-mono text-[10px] uppercase tracking-wide text-rose-600">stderr</div>
-                            <pre class="m-0 whitespace-pre-wrap px-2 py-1.5 font-mono text-[11px] leading-relaxed text-rose-700">{{ itemCommandExecution(item)?.stderr }}</pre>
-                          </div>
-                        </div>
-                        <pre
-                          v-else
-                          class="m-0 whitespace-pre-wrap text-[12px] leading-relaxed"
-                          :class="itemTextClass(item)"
-                        >{{ itemBody(item) }}</pre>
-                      </div>
-                    </div>
-                  </div>
-                  </template>
-                </div>
-
-              </template>
-            </div>
-
-          </div>
-
-        </template>
-      </div>
-    </section>
-
-    <!-- Input -->
-    <footer v-if="view === 'chat'" class="shrink-0 border-t border-neutral-200 bg-white/95 backdrop-blur-sm">
-      <div class="px-5 py-4">
-        <div class="rounded-2xl border border-neutral-300 bg-white px-3 py-3">
-          <div class="relative">
-            <textarea
-              ref="editorEl"
-              v-model="editorText"
-              rows="5"
-              class="w-full resize-none border-0 bg-transparent px-0 pb-3 pt-0 font-sans text-sm text-neutral-900 outline-none placeholder:text-neutral-300"
-              placeholder="Write a prompt..."
-              @keydown="onEditorKeydown"
-              @click="onEditorSelectionChange"
-              @keyup="onEditorSelectionChange"
-              @select="onEditorSelectionChange"
-              @scroll="onEditorScroll"
-            />
-            <div class="pointer-events-none absolute inset-0 z-10 overflow-visible rounded-xl">
-              <div
-                v-for="cursor in cursorOverlays"
-                :key="cursor.userId"
-                class="absolute"
-                :style="{ left: `${cursor.left}px`, top: `${cursor.top}px` }"
-              >
-                <span
-                  class="absolute left-0 top-0 w-0.5 rounded-full"
-                  :style="{ height: `${cursor.height}px`, backgroundColor: cursor.color }"
-                ></span>
-                <span
-                  class="absolute left-1 top-0 -translate-y-full whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium leading-none text-white"
-                  :style="{ backgroundColor: cursor.color }"
-                >
-                  {{ cursor.userName }}
-                </span>
-              </div>
-            </div>
-          </div>
-          <div class="flex flex-wrap items-center gap-2 border-t border-neutral-200 pt-3">
-            <div class="flex min-w-0 flex-wrap items-center gap-0 text-xs text-neutral-600">
-              <div ref="modelMenuEl" class="relative">
-                <button
-                  type="button"
-                  class="inline-flex items-center gap-1.5 py-1 text-left text-xs text-neutral-700 transition-colors hover:text-neutral-950"
-                  @click="toggleMenu('model')"
-                >
-                  <span class="truncate">{{ selectedModelButtonLabel }}</span>
-                  <span class="text-[10px] text-neutral-400">{{ openMenu === 'model' ? '▴' : '▾' }}</span>
-                </button>
-                <div
-                  v-if="openMenu === 'model'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 min-w-60 max-w-88 overflow-hidden rounded-md border border-neutral-200 bg-white"
-                >
-                  <button
-                    v-for="option in modelOptions"
-                    :key="option.id"
-                    type="button"
-                    class="flex w-full items-start border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
-                    @click="selectModelOption(option.id)"
-                  >
-                    <span class="min-w-0 flex-1">
-                      <span class="flex items-center justify-between gap-3">
-                        <span class="block truncate">{{ option.label }}</span>
-                        <span v-if="selectedModel === option.id" class="shrink-0 text-[10px] text-neutral-400">current</span>
-                      </span>
-                      <span v-if="option.description" class="mt-0.5 block text-[11px] leading-4 text-neutral-400">
-                        {{ option.description }}
-                      </span>
-                    </span>
-                  </button>
-                </div>
-              </div>
-              <span class="mx-3 h-4 w-px bg-neutral-200"></span>
-              <div ref="effortMenuEl" class="relative">
-                <button
-                  type="button"
-                  class="inline-flex items-center gap-1.5 py-1 text-left text-xs text-neutral-700 transition-colors hover:text-neutral-950"
-                  @click="toggleMenu('effort')"
-                >
-                  <span class="truncate">{{ selectedEffortLabel }}</span>
-                  <span class="text-[10px] text-neutral-400">{{ openMenu === 'effort' ? '▴' : '▾' }}</span>
-                </button>
-                <div
-                  v-if="openMenu === 'effort'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 min-w-56 max-w-64 overflow-hidden rounded-md border border-neutral-200 bg-white"
-                >
-                  <button
-                    v-for="option in effortOptions"
-                    :key="option.id"
-                    type="button"
-                    class="flex w-full items-start border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 last:border-0 hover:bg-neutral-50"
-                    @click="selectEffortOption(option.id)"
-                  >
-                    <span class="min-w-0 flex-1">
-                      <span class="flex items-center justify-between gap-3">
-                        <span class="block truncate">{{ option.label }}</span>
-                        <span v-if="selectedEffort === option.id" class="shrink-0 text-[10px] text-neutral-400">current</span>
-                      </span>
-                      <span v-if="option.description" class="mt-0.5 block text-[11px] leading-4 text-neutral-400">
-                        {{ option.description }}
-                      </span>
-                    </span>
-                  </button>
-                </div>
-              </div>
-              <span class="mx-3 h-4 w-px bg-neutral-200"></span>
-              <div ref="accessMenuEl" class="relative">
-                <button
-                  type="button"
-                  class="inline-flex items-center gap-1.5 py-1 text-left text-xs text-neutral-700 transition-colors hover:text-neutral-950"
-                  @click="toggleMenu('access')"
-                >
-                  <span class="truncate">{{ selectedAccessLabel }}</span>
-                  <span class="text-[10px] text-neutral-400">{{ openMenu === 'access' ? '▴' : '▾' }}</span>
-                </button>
-                <div
-                  v-if="openMenu === 'access'"
-                  class="absolute bottom-[calc(100%+0.5rem)] left-0 z-20 min-w-[10rem] overflow-hidden rounded-md border border-neutral-200 bg-white"
-                >
-                  <button
-                    type="button"
-                    class="flex w-full items-center justify-between gap-3 border-b border-neutral-100 px-3 py-2 text-left text-[12px] text-neutral-700 hover:bg-neutral-50"
-                    @click="selectAccessMode('full-access')"
-                  >
-                    <span>Full Access</span>
-                    <span v-if="accessMode === 'full-access'" class="text-[10px] text-neutral-400">current</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-[12px] text-neutral-700 hover:bg-neutral-50"
-                    @click="selectAccessMode('need-approve')"
-                  >
-                    <span>Need Approve</span>
-                    <span v-if="accessMode === 'need-approve'" class="text-[10px] text-neutral-400">current</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-            <div class="ml-auto flex items-center gap-2">
-              <span class="text-[11px] text-neutral-400">
-                <span :title="contextAvailabilityTitle">
-                {{ contextAvailabilityText }}
-                </span>
-              </span>
-              <button
-                v-if="running"
-                :disabled="!canInterrupt"
-                @click="interruptCodex"
-                class="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3.5 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-30"
-              >
-                Stop
-              </button>
-              <button
-                :disabled="!canSubmit"
-                @click="sendToCodex"
-                class="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-25"
-              >
-                <span
-                  v-if="running"
-                  class="size-[10px] animate-spin rounded-full border-[1.5px] border-white/30 border-t-white"
-                ></span>
-                {{ running ? 'Steer' : 'Run' }}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </footer>
-
+      <CodexComposer
+        v-model="editorText"
+        :cursor-overlays="cursorOverlays"
+        :model-options="modelOptions"
+        :selected-model="selectedModel"
+        :selected-model-button-label="selectedModelButtonLabel"
+        :effort-options="effortOptions"
+        :selected-effort="selectedEffort"
+        :selected-effort-label="selectedEffortLabel"
+        :access-mode="accessMode"
+        :selected-access-label="selectedAccessLabel"
+        :context-availability-text="contextAvailabilityText"
+        :context-availability-title="contextAvailabilityTitle"
+        :running="running"
+        :can-interrupt="canInterrupt"
+        :can-submit="canSubmit"
+        :set-textarea-el="setEditorEl"
+        @editor-keydown="onEditorKeydown"
+        @editor-selection-change="onEditorSelectionChange"
+        @editor-scroll="onEditorScroll"
+        @select-model="selectModelOption"
+        @select-effort="selectEffortOption"
+        @select-access="selectAccessMode"
+        @interrupt="interruptCodex"
+        @submit="sendToCodex"
+      />
+    </template>
   </div>
 </template>
-
-<style scoped>
-:deep(.markdown-body) {
-  color: inherit;
-}
-
-:deep(.markdown-body > :first-child) {
-  margin-top: 0;
-}
-
-:deep(.markdown-body > :last-child) {
-  margin-bottom: 0;
-}
-
-:deep(.markdown-body p),
-:deep(.markdown-body ul),
-:deep(.markdown-body ol),
-:deep(.markdown-body pre),
-:deep(.markdown-body blockquote) {
-  margin: 0 0 0.75rem;
-}
-
-:deep(.markdown-body ul),
-:deep(.markdown-body ol) {
-  padding-left: 1.25rem;
-}
-
-:deep(.markdown-body li + li) {
-  margin-top: 0.2rem;
-}
-
-:deep(.markdown-body code) {
-  border-radius: 0.375rem;
-  background: #f5f5f4;
-  padding: 0.1rem 0.35rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.92em;
-}
-
-:deep(.markdown-body pre) {
-  overflow-x: auto;
-  border-radius: 0.75rem;
-  border: 1px solid #e5e7eb;
-  background: #f5f5f4;
-  padding: 0.85rem 1rem;
-  color: #1f2937;
-}
-
-:deep(.markdown-body pre code) {
-  background: transparent;
-  padding: 0;
-  color: inherit;
-}
-
-:deep(.markdown-body a) {
-  color: #0f766e;
-  text-decoration: underline;
-  text-underline-offset: 0.12em;
-}
-
-:deep(.markdown-body blockquote) {
-  border-left: 3px solid #d4d4d4;
-  padding-left: 0.9rem;
-  color: #525252;
-}
-</style>

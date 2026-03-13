@@ -1,3 +1,5 @@
+import { threadStatusTypeFromValue } from '@codex-room/shared';
+
 export type EffortOptionLike = {
   id: string;
   label: string;
@@ -5,6 +7,7 @@ export type EffortOptionLike = {
 };
 
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
+export type AccessMode = 'full-access' | 'need-approve';
 
 export function formatEffortLabel(value: string): string {
   return value
@@ -14,13 +17,7 @@ export function formatEffortLabel(value: string): string {
     .join(' ');
 }
 
-export function threadStatusTypeFromValue(status: unknown): string {
-  if (typeof status === 'string') return status;
-  if (status && typeof status === 'object' && typeof (status as Record<string, unknown>).type === 'string') {
-    return ((status as Record<string, unknown>).type as string).trim();
-  }
-  return '';
-}
+export { threadStatusTypeFromValue };
 
 export function approvalDecisionOptionsFromValue(value: unknown): ApprovalDecision[] {
   const allowed: ApprovalDecision[] = ['accept', 'acceptForSession', 'decline', 'cancel'];
@@ -94,4 +91,24 @@ export function buildGrantedPermissions(requestedPermissions: unknown, grantedWr
   }
 
   return requested;
+}
+
+export function approvalPolicyForMode(mode: AccessMode): string {
+  return mode === 'full-access' ? 'never' : 'unlessTrusted';
+}
+
+export function sandboxModeForMode(mode: AccessMode): string {
+  return mode === 'full-access' ? 'danger-full-access' : 'workspace-write';
+}
+
+export function sandboxPolicyForMode(mode: AccessMode, workingDirectory: string): Record<string, unknown> {
+  if (mode === 'full-access') {
+    return { type: 'dangerFullAccess' };
+  }
+
+  return {
+    type: 'workspaceWrite',
+    ...(workingDirectory ? { writableRoots: [workingDirectory] } : {}),
+    networkAccess: true
+  };
 }

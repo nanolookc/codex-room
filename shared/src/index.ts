@@ -147,3 +147,5 @@ export interface CodexRpcRespondInput {
     data?: unknown;
   };
 }
+
+export * from './codexProtocol';
