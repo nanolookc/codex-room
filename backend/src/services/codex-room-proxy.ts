@@ -14,6 +14,14 @@ type RoomSession = RoomSessionState & {
   session: AppServerSession;
 };
 
+const LIVE_THREAD_METHODS = new Set([
+  'review/start',
+  'thread/compact/start',
+  'thread/rollback',
+  'turn/start',
+  'turn/steer'
+]);
+
 type Hooks = {
   publish: (roomId: string, event: import('@codex-room/shared').RoomEvent) => void;
   getThreadId: (roomId: string) => string | undefined;
@@ -46,9 +54,10 @@ export class CodexRoomProxyManager {
       throw new Error('initialize/initialized are managed by the backend');
     }
 
-    const room = await this.ensureRoom(roomId);
+    const { room, created } = await this.ensureRoom(roomId);
     room.lastActiveAt = Date.now();
     const nextParams = await this.policy.applyRequestPolicy(room.session, method, params);
+    await this.resumeThreadIfNeeded(roomId, room, created, method, nextParams);
 
     if (method === 'turn/start') {
       capturePendingTurnStart(room, nextParams);
@@ -76,9 +85,9 @@ export class CodexRoomProxyManager {
     resolveServerRequest(roomId, room, this.hooks, requestId, payload);
   }
 
-  private async ensureRoom(roomId: string): Promise<RoomSession> {
+  private async ensureRoom(roomId: string): Promise<{ room: RoomSession; created: boolean }> {
     const existing = this.rooms.get(roomId);
-    if (existing) return existing;
+    if (existing) return { room: existing, created: false };
 
     const session = await AppServerSession.start(this.logger);
     const room: RoomSession = {
@@ -98,7 +107,35 @@ export class CodexRoomProxyManager {
     });
 
     this.rooms.set(roomId, room);
-    return room;
+    return { room, created: true };
+  }
+
+  private async resumeThreadIfNeeded(
+    roomId: string,
+    room: RoomSession,
+    created: boolean,
+    method: string,
+    params: unknown
+  ) {
+    if (!created || !LIVE_THREAD_METHODS.has(method)) return;
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return;
+
+    const requestParams = params as Record<string, unknown>;
+    const threadId = typeof requestParams.threadId === 'string' ? requestParams.threadId : null;
+    if (!threadId) return;
+
+    const rememberedThreadId = this.hooks.getThreadId(roomId);
+    if (!rememberedThreadId || rememberedThreadId !== threadId) return;
+
+    this.logger.info('codex.room_proxy.thread.resume', {
+      roomId,
+      threadId,
+      method,
+      reason: 'session_recreated'
+    });
+
+    const resumeParams = await this.policy.applyRequestPolicy(room.session, 'thread/resume', { threadId });
+    await room.session.request('thread/resume', resumeParams);
   }
 
   private sweepIdleRooms() {
